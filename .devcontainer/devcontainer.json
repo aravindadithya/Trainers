@@ -1,5 +1,5 @@
 {
-    "name": "VastAI-PyTorch-Sync",
+    "name": "Torch Dev Container",
     "image": "vastai/pytorch:cuda-12.4.1-auto",
     "workspaceFolder": "/workspaces", // Explicitly sets the root
     

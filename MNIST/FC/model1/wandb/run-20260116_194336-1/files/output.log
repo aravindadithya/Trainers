@@ -1,0 +1,21 @@
+EPOCH:  0
+Time:  10.854722023010254
+EPOCH:  1
+Time:  9.077205896377563
+EPOCH:  2
+Time:  9.03226613998413
+EPOCH:  3
+Time:  9.064820289611816
+EPOCH:  4
+Time:  10.572325706481934
+EPOCH:  5
+Time:  9.199328422546387
+EPOCH:  6
+Time:  9.324207305908203
+EPOCH:  7
+Time:  8.70539116859436
+EPOCH:  8
+Time:  9.052067756652832
+EPOCH:  9
+Time:  8.833933353424072
+[34m[1mwandb[0m: [32m[41mERROR[0m The nbformat package was not found. It is required to save notebook history.
