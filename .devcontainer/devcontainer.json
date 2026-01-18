@@ -19,7 +19,9 @@
             "extensions": [
                 "ms-python.python",
                 "ms-toolsai.jupyter",
-                "ms-python.vscode-pylance"
+                "ms-python.vscode-pylance",
+                "google.geminicodeassist",
+                "google.gemini-cli-vscode-ide-companion"
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/venv/main/bin/python",

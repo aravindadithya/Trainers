@@ -1,11 +1,13 @@
 
 import torch
+import torchvision.utils as vutils
+import wandb
 import time
 import os
 from torch.amp import autocast
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
-import wandb
+
 
 
 def initialize_wandb(names, optimizer, lfn, net, num_epochs):
@@ -19,7 +21,7 @@ def initialize_wandb(names, optimizer, lfn, net, num_epochs):
         "learning_rate": optimizer.param_groups[0]['lr'],
         "optimizer": type(optimizer).__name__,
         "loss_function": type(lfn).__name__,
-        "epochs": num_epochs,
+        #"epochs": num_epochs,
         "model_architecture": type(net).__name__,
         "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
     }
@@ -47,7 +49,7 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     initialize_wandb(names, optimizer, lfn, net, num_epochs)
 
     net.cuda()
-    wandb.watch(net, log="all", log_freq=100)
+    wandb.watch(net, log="all", log_freq=10)
     #net.to(dtype=torch.float32, device='cuda')
     best_val_acc = 0
     best_test_acc = 0
@@ -55,6 +57,17 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     best_val_loss = float("inf")
     best_test_loss = 0
     os.makedirs(root_path, exist_ok=True)
+
+    viz_images = None
+    try:
+        viz_iter = iter(val_loader)
+        viz_inputs, _ = next(viz_iter)
+        viz_images = viz_inputs[:10]
+        wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))]})
+        viz_images = viz_images.cuda()
+    except Exception as e:
+        print(f"Viz setup failed: {e}")
+
     for i in range(num_epochs):
 
         print("EPOCH: ", i)
@@ -74,10 +87,10 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             net.to(dtype=torch.float32, device='cuda')
             init_net.to(dtype=torch.float32, device='cpu')
 
-        train_loss = train_step(net, optimizer, lfn, train_loader)
-        val_loss = val_step(net, val_loader, lfn)       
-        train_acc = get_acc_ce(net, train_loader)
-        val_acc = get_acc_ce(net, val_loader)           
+        #Train loss and accuracy are calculated on the fly during training
+        train_loss, train_acc = train_step(net, optimizer, lfn, train_loader)
+        # Validation loss and accuracy are calculated after each epoch
+        val_loss, val_acc = val_step(net, val_loader, lfn)       
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
@@ -88,24 +101,23 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             file_path = os.path.join(root_path, 'best_model.pth')
             torch.save(d, file_path)
             #net.cuda()
-        '''
-        if val_loss <= best_val_loss:
-            #best_val_loss = val_loss
-            #best_test_loss = test_loss
-            '''
-        '''
-        wandb.log({
+
+        log_data = {
             "train/accuracy": train_acc,
             "train/loss": train_loss,
             "val/accuracy": val_acc,
             "val/loss": val_loss,
-        })'''
+        }
+        
+        if viz_images is not None:
+            log_data.update(log_cnn_visuals(net, viz_images))
+
+        wandb.log(log_data)
 
     checkpoint = torch.load(os.path.join(root_path, 'best_model.pth'), weights_only=True)
     net.load_state_dict(checkpoint['state_dict'])
 
-    best_test_loss = val_step(net, test_loader, lfn)
-    best_test_acc = get_acc_ce(net, test_loader)
+    best_test_loss, best_test_acc = val_step(net, test_loader, lfn)
     
     wandb.run.summary["best_test_accuracy"] = best_test_acc
     wandb.run.summary["best_test_loss"] = best_test_loss
@@ -136,6 +148,8 @@ def train_step(net, optimizer, lfn, train_loader):
     net.train()
     start = time.time()
     train_loss = 0.
+    correct = 0
+    total = 0
 
     for batch_idx, batch in enumerate(train_loader):
         optimizer.zero_grad()
@@ -157,16 +171,27 @@ def train_step(net, optimizer, lfn, train_loader):
         wandb.log({"batch/loss": loss.item()})               
         train_loss += loss.detach().item() * len(inputs)
         
+        _, predicted = torch.max(output.data, 1)
+        total += target.size(0)
+        if len(target.size()) > 1:
+            _, labels_idx = torch.max(target, -1)
+        else:
+            labels_idx = target
+        correct += (predicted == labels_idx).sum().item()
+        
     end = time.time()
     print("Time: ", end - start)
     train_loss = train_loss / len(train_loader.dataset)
-    return train_loss
+    train_acc = 100 * correct / total
+    return train_loss, train_acc
 
 
 def val_step(net, val_loader, lfn):
     global scaler
     net.eval()
     val_loss = 0.
+    correct = 0
+    total = 0
 
     for batch_idx, batch in enumerate(val_loader):
         inputs, labels = batch
@@ -180,10 +205,60 @@ def val_step(net, val_loader, lfn):
                 loss = lfn(output, target)
                 
             val_loss += loss.detach().item() * len(inputs)
+            
+            _, predicted = torch.max(output.data, 1)
+            total += target.size(0)
+            if len(target.size()) > 1:
+                _, labels_idx = torch.max(target, -1)
+            else:
+                labels_idx = target
+            correct += (predicted == labels_idx).sum().item()
         
     val_loss = val_loss / len(val_loader.dataset)
-    return val_loss
+    val_acc = 100 * correct / total
+    return val_loss, val_acc
 
+def log_cnn_visuals(net, images):
+    net.eval()
+    activations = {}
+    hooks = []
+
+    def get_activation(name):
+        def hook(model, input, output):
+            activations[name] = output.detach()
+        return hook
+
+    for name, layer in net.named_modules():
+        if isinstance(layer, torch.nn.Conv2d):
+            hooks.append(layer.register_forward_hook(get_activation(name)))
+
+    with torch.no_grad():
+        net(images)
+
+    visuals = {}
+    for name, layer in net.named_modules():
+        if isinstance(layer, torch.nn.Conv2d):
+            w = layer.weight.data
+            op,ip, q, s = w.shape
+            #w = w.transpose(ip, op, q, s)
+            w = w.reshape(op*ip, 1, q, s)
+            grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=True)
+            visuals[f"Images/weights/{name}"] = wandb.Image(grid_w, caption=f"Weights {name}")
+            
+            if name in activations:
+                act = activations[name]
+                n, ip, q, s = act.shape
+                act = act.view(n*ip, 1, q, s)
+                grid_a = vutils.make_grid(act, nrow=ip, normalize=True, scale_each=True)
+                visuals[f"Images/activations/{name}"] = wandb.Image(grid_a, caption=f"Activations {name}")
+    
+    for h in hooks:
+        h.remove()
+        
+    return visuals
+
+
+'''
 
 def get_acc_ce(net, loader):
     global scaler
@@ -205,3 +280,4 @@ def get_acc_ce(net, loader):
             correct += (predicted == labels).sum().item()
     return 100 * correct / total
 
+    '''
