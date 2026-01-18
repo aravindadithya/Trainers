@@ -17,12 +17,17 @@ def initialize_wandb(names, optimizer, lfn, net, num_epochs):
     id = names['run_id']
 
     # Extracting config details
-    config = {
+    config = { 
+        "project": project,
+        "run_name": run_name,
+        "run_id": id,
         "learning_rate": optimizer.param_groups[0]['lr'],
         "optimizer": type(optimizer).__name__,
         "loss_function": type(lfn).__name__,
         #"epochs": num_epochs,
         "model_architecture": type(net).__name__,
+        "model_structure": str(net),
+        "num_parameters": sum(p.numel() for p in net.parameters()),
         "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
     }
 
@@ -38,18 +43,20 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
 
 
     params = 0
+    '''
     for idx, param in enumerate(list(net.parameters())):
         size = 1
         for idx in range(len(param.size())):
             size *= param.size()[idx]
             params += size
     print("NUMBER OF PARAMS: ", params)
-
+    '''
+    
     print("Initializing Wandb:")
     initialize_wandb(names, optimizer, lfn, net, num_epochs)
 
     net.cuda()
-    wandb.watch(net, log="all", log_freq=10)
+    wandb.watch(net, log="all", log_freq=10, idx=0)
     #net.to(dtype=torch.float32, device='cuda')
     best_val_acc = 0
     best_test_acc = 0
@@ -65,10 +72,21 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
         viz_images = viz_inputs[:10]
         wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))]})
         viz_images = viz_images.cuda()
+        '''
+        # Export to ONNX for architecture visualization
+        dummy_input = viz_inputs[0].unsqueeze(0).cuda()
+        onnx_path = os.path.join(root_path, "model.onnx")
+        torch.onnx.export(net, dummy_input, onnx_path)
+        wandb.save(onnx_path)
+        '''
     except Exception as e:
         print(f"Viz setup failed: {e}")
 
-    for i in range(num_epochs):
+    start_epoch = 0
+    if wandb.run.resumed:
+        start_epoch = wandb.run.summary.get("epoch", -1) + 1
+
+    for i in range(start_epoch, start_epoch + num_epochs):
 
         print("EPOCH: ", i)
 
@@ -90,7 +108,15 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
         #Train loss and accuracy are calculated on the fly during training
         train_loss, train_acc = train_step(net, optimizer, lfn, train_loader)
         # Validation loss and accuracy are calculated after each epoch
-        val_loss, val_acc = val_step(net, val_loader, lfn)       
+        val_loss, val_acc, val_preds, val_targets = val_step(net, val_loader, lfn)       
+
+        log_data = {
+            "epoch": i,
+            "train/accuracy": train_acc,
+            "train/loss": train_loss,
+            "val/accuracy": val_acc,
+            "val/loss": val_loss,
+        }
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
@@ -101,15 +127,11 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             file_path = os.path.join(root_path, 'best_model.pth')
             torch.save(d, file_path)
             #net.cuda()
-
-        log_data = {
-            "train/accuracy": train_acc,
-            "train/loss": train_loss,
-            "val/accuracy": val_acc,
-            "val/loss": val_loss,
-        }
+            log_data["Validation Confusion Matrix"] = wandb.plot.confusion_matrix(probs=None,
+                                                    y_true=val_targets, preds=val_preds,
+                                                    class_names=[str(i) for i in range(10)])
         
-        if viz_images is not None:
+        if names['type'] == 'CNN' and viz_images is not None:
             log_data.update(log_cnn_visuals(net, viz_images))
 
         wandb.log(log_data)
@@ -117,12 +139,15 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     checkpoint = torch.load(os.path.join(root_path, 'best_model.pth'), weights_only=True)
     net.load_state_dict(checkpoint['state_dict'])
 
-    best_test_loss, best_test_acc = val_step(net, test_loader, lfn)
+    best_test_loss, best_test_acc, test_preds, test_targets = val_step(net, test_loader, lfn)
     
     wandb.run.summary["best_test_accuracy"] = best_test_acc
     wandb.run.summary["best_test_loss"] = best_test_loss
     wandb.run.summary["best_val_accuracy"] = best_val_acc
     wandb.run.summary["best_val_loss"] = best_val_loss
+    wandb.log({"Test Confusion Matrix": wandb.plot.confusion_matrix(probs=None,
+                                                            y_true=test_targets, preds=test_preds,
+                                                            class_names=[str(i) for i in range(10)])})
     wandb.finish()
     
     print("FINISHED TRAINING :)")
@@ -192,6 +217,8 @@ def val_step(net, val_loader, lfn):
     val_loss = 0.
     correct = 0
     total = 0
+    all_preds = []
+    all_targets = []
 
     for batch_idx, batch in enumerate(val_loader):
         inputs, labels = batch
@@ -213,10 +240,13 @@ def val_step(net, val_loader, lfn):
             else:
                 labels_idx = target
             correct += (predicted == labels_idx).sum().item()
+            
+            all_preds.extend(predicted.tolist())
+            all_targets.extend(labels_idx.tolist())
         
     val_loss = val_loss / len(val_loader.dataset)
     val_acc = 100 * correct / total
-    return val_loss, val_acc
+    return val_loss, val_acc, all_preds, all_targets
 
 def log_cnn_visuals(net, images):
     net.eval()

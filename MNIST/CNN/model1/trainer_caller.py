@@ -11,7 +11,7 @@ workspaces_path= os.getenv('PYTHONPATH')
 print(f"Current Path: {workspaces_path}")
 
 model_name = 'MNIST/CNN/model1'
-names = {'project':'MNIST'}
+names = {'project':'MNIST', 'type':'CNN'}
 
 
 # ACCESS LOADERS
@@ -63,7 +63,7 @@ def train_net(force_train=False, run_id="1", fn=None, kwargs={}):
                     root_path= model_dir, 
                     optimizer=torch.optim.SGD(net.parameters(), lr=.1),
                     lfn=  nn.CrossEntropyLoss(), 
-                    num_epochs = 10,
+                    num_epochs = 20,
                     names=names, net=net, init_net= init_net, save_init= not force_train, fn=fn, kwargs=kwargs)
            
         
