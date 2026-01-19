@@ -3,3 +3,5 @@ tqdm==4.67.1
 ipykernel==6.29.5
 torchmetrics
 wandb
+onnx
+onnxscript

@@ -1,5 +1,7 @@
 
 import torch
+import torch.nn.functional as F
+import torch.onnx
 import torchvision.utils as vutils
 import wandb
 import time
@@ -8,7 +10,15 @@ from torch.amp import autocast
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
-
+'''
+TODO: 1. Log Saliency maps
+2. Ablation studies
+3. Effect of covariance matrix of weight filters
+4. Bunch of validation images and predicted vs actual labels
+5. Log initialization technique
+Optimization: All the specialized logs like log_cnn_visuals
+can be merged into val_step. This affects readability but improves speed.
+''' 
 
 def initialize_wandb(names, optimizer, lfn, net, num_epochs):
     
@@ -42,15 +52,6 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
                   names=None, num_epochs = 5, save_init= False, fn=None, kwargs={}):
 
 
-    params = 0
-    '''
-    for idx, param in enumerate(list(net.parameters())):
-        size = 1
-        for idx in range(len(param.size())):
-            size *= param.size()[idx]
-            params += size
-    print("NUMBER OF PARAMS: ", params)
-    '''
     
     print("Initializing Wandb:")
     initialize_wandb(names, optimizer, lfn, net, num_epochs)
@@ -69,16 +70,14 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     try:
         viz_iter = iter(val_loader)
         viz_inputs, _ = next(viz_iter)
-        viz_images = viz_inputs[:10]
+        viz_images = viz_inputs[:20]
         wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))]})
         viz_images = viz_images.cuda()
-        '''
         # Export to ONNX for architecture visualization
         dummy_input = viz_inputs[0].unsqueeze(0).cuda()
         onnx_path = os.path.join(root_path, "model.onnx")
-        torch.onnx.export(net, dummy_input, onnx_path)
+        torch.onnx.export(net, dummy_input, onnx_path, input_names=['input'], output_names=['output'])
         wandb.save(onnx_path)
-        '''
     except Exception as e:
         print(f"Viz setup failed: {e}")
 
@@ -130,6 +129,7 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             log_data["Validation Confusion Matrix"] = wandb.plot.confusion_matrix(probs=None,
                                                     y_true=val_targets, preds=val_preds,
                                                     class_names=[str(i) for i in range(10)])
+            log_data["Validation Predictions"] = log_predictions_table(net, val_loader, limit=256)
         
         if names['type'] == 'CNN' and viz_images is not None:
             log_data.update(log_cnn_visuals(net, viz_images))
@@ -148,6 +148,7 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     wandb.log({"Test Confusion Matrix": wandb.plot.confusion_matrix(probs=None,
                                                             y_true=test_targets, preds=test_preds,
                                                             class_names=[str(i) for i in range(10)])})
+    wandb.log({"Test Predictions": log_predictions_table(net, test_loader, limit=256)})
     wandb.finish()
     
     print("FINISHED TRAINING :)")
@@ -286,6 +287,55 @@ def log_cnn_visuals(net, images):
         h.remove()
         
     return visuals
+
+
+def log_predictions_table(net, loader, limit=None):
+    net.eval()
+    columns = ["Image", "Ground Truth", "Prediction", "Confidence"] + [f"Score_{i}" for i in range(10)]
+    table = wandb.Table(columns=columns)
+    
+    count = 0
+    with torch.no_grad():
+        for batch in loader:
+            inputs, targets = batch
+            inputs = inputs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            
+            with autocast(device_type='cuda'):
+                outputs = net(inputs)
+                probs = F.softmax(outputs, dim=1)
+            
+            confidences, preds = torch.max(probs, 1)
+            
+            if len(targets.size()) > 1:
+                _, targets_idx = torch.max(targets, -1)
+            else:
+                targets_idx = targets
+                
+            inputs_cpu = inputs.cpu()
+            targets_cpu = targets_idx.cpu()
+            preds_cpu = preds.cpu()
+            confidences_cpu = confidences.cpu()
+            probs_cpu = probs.cpu()
+            
+            for j in range(len(inputs)):
+                if limit is not None and count >= limit:
+                    return table
+                
+                if preds_cpu[j] == targets_cpu[j]:
+                    continue
+
+                img = inputs_cpu[j]
+                #TODO: Handle the case when image is given as 1D tensor properly.
+                if img.dim() == 1:
+                    img = img.view(1, 28, 28)
+                
+                img_viz = vutils.make_grid(img, normalize=True)
+                row = [wandb.Image(img_viz), str(targets_cpu[j].item()), str(preds_cpu[j].item()), confidences_cpu[j].item()]
+                row.extend(probs_cpu[j].tolist())
+                table.add_data(*row)
+                count += 1
+    return table
 
 
 '''

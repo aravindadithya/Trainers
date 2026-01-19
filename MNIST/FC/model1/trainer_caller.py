@@ -13,7 +13,7 @@ workspaces_path = "/workspaces/Trainers/"
 print(f"Current Path: {workspaces_path}")
 
 model_name = 'MNIST/FC/model1'
-names = {'project':'MNIST'}
+names = {'project':'MNIST', 'type':'FC'}
 
 
 
@@ -64,7 +64,7 @@ def train_net(force_train=False, run_id="1", fn=None, kwargs={}):
     path_exists = os.path.exists(model_dir + 'best_model.pth')
     
     names['run_id']= run_id
-    names['name']= f"{model_name}/{run_id}"
+    names['name']= f"{model_name}"
 
     if path_exists:
         checkpoint = torch.load(model_dir + 'best_model.pth', weights_only=True)
