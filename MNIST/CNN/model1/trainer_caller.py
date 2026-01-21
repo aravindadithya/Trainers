@@ -16,6 +16,13 @@ names = {'project':'MNIST', 'type':'CNN'}
 
 # ACCESS LOADERS
 def get_loaders():
+    
+    SEED = 5700
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))  # Mean and standard deviation for MNIST
@@ -26,7 +33,7 @@ def get_loaders():
     train_len = int(len(trainset) * 0.8)
     val_len = len(trainset) - train_len
     trainset, valset = torch.utils.data.random_split(trainset, [train_len, val_len])
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=1024, shuffle=False, num_workers=10, pin_memory=True)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=1024, shuffle=True, num_workers=10, pin_memory=True)
     valloader = torch.utils.data.DataLoader(valset, batch_size=1024,
                                                 shuffle=False, num_workers=10, pin_memory=True)
     

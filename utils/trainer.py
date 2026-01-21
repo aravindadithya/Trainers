@@ -5,22 +5,17 @@ import torch.onnx
 import torchvision.utils as vutils
 import wandb
 import time
-import os
+import io
 from torch.amp import autocast
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
 '''
-TODO: 1. Log Saliency maps
-2. Ablation studies
-3. Effect of covariance matrix of weight filters
-4. Bunch of validation images and predicted vs actual labels
-5. Log initialization technique
 Optimization: All the specialized logs like log_cnn_visuals
 can be merged into val_step. This affects readability but improves speed.
 ''' 
 
-def initialize_wandb(names, optimizer, lfn, net, num_epochs):
+def initialize_wandb(names, optimizer, lfn, net, scheduler=None):
     
     project = names['project']
     run_name = names['name']
@@ -39,6 +34,7 @@ def initialize_wandb(names, optimizer, lfn, net, num_epochs):
         "model_structure": str(net),
         "num_parameters": sum(p.numel() for p in net.parameters()),
         "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
+        "scheduler": type(scheduler).__name__ if scheduler else "None",
     }
 
     #TODO: REMOVE THIS KEY BEFORE PUSHING
@@ -48,57 +44,71 @@ def initialize_wandb(names, optimizer, lfn, net, num_epochs):
 
 
 
-def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn, root_path,
-                  names=None, num_epochs = 5, save_init= False, fn=None, kwargs={}):
+def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn,
+                  scheduler=None, names=None, num_epochs = 5, fn=None, kwargs={}):
 
 
     
     print("Initializing Wandb:")
-    initialize_wandb(names, optimizer, lfn, net, num_epochs)
+    initialize_wandb(names, optimizer, lfn, net, scheduler)
 
     net.cuda()
     wandb.watch(net, log="all", log_freq=10, idx=0)
-    #net.to(dtype=torch.float32, device='cuda')
     best_val_acc = 0
     best_test_acc = 0
-    #best_val_loss = np.float("inf")
     best_val_loss = float("inf")
     best_test_loss = 0
-    os.makedirs(root_path, exist_ok=True)
-
+    best_state_dict = None
     viz_images = None
+
     try:
         viz_iter = iter(val_loader)
         viz_inputs, _ = next(viz_iter)
         viz_images = viz_inputs[:20]
         wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))]})
         viz_images = viz_images.cuda()
-        # Export to ONNX for architecture visualization
+        net.eval()
         dummy_input = viz_inputs[0].unsqueeze(0).cuda()
-        onnx_path = os.path.join(root_path, "model.onnx")
-        torch.onnx.export(net, dummy_input, onnx_path, input_names=['input'], output_names=['output'])
-        wandb.save(onnx_path)
+        artifact = wandb.Artifact(f"onnx-{names['run_id']}", type='model')
+        onnx_buffer = io.BytesIO()
+        torch.onnx.export(net, dummy_input, onnx_buffer, input_names=['input'], output_names=['output'])
+        with artifact.new_file('model.onnx', mode='wb') as f:
+            f.write(onnx_buffer.getvalue())
+        wandb.log_artifact(artifact)
+        net.train()
     except Exception as e:
         print(f"Viz setup failed: {e}")
 
-    start_epoch = 0
+    start_epoch = 1
     if wandb.run.resumed:
-        start_epoch = wandb.run.summary.get("epoch", -1) + 1
+        start_epoch = wandb.run.summary.get("epoch", 0) + 1
+        best_val_acc = wandb.run.summary.get("best_val_accuracy", 0)
+        best_val_loss = wandb.run.summary.get("best_val_loss", float("inf"))
+        try:
+            artifact = wandb.use_artifact(f"checkpoint-{names['run_id']}:latest")
+            path = artifact.get_entry('last_model.pth').download()
+            checkpoint = torch.load(path, weights_only=True)
+            net.load_state_dict(checkpoint['state_dict'])
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if scheduler and 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            best_state_dict = checkpoint['state_dict']
+            print(f"Resumed from artifact. Best Val Acc: {best_val_acc}")
+        except Exception as e:
+            print(f"Failed to resume from artifact: {e}")
+    else:
+        # Log initial weights for new runs
+        artifact = wandb.Artifact(f"init-weights-{names['run_id']}", type='model', metadata={"epoch": 0})
+        with artifact.new_file('init_model.pth', mode='wb') as f:
+            torch.save({'state_dict': net.state_dict()}, f)
+        wandb.log_artifact(artifact)
 
     for i in range(start_epoch, start_epoch + num_epochs):
 
         print("EPOCH: ", i)
 
-        if save_init and (i == 0 or i == 1):
-            #net.cpu()
-            d = {}
-            d['state_dict'] = net.state_dict()    
-            file_path = os.path.join(root_path, f'trained_nn_{i}.pth')
-            torch.save(d, file_path)
-            #net.cuda()
         if fn is not None:
-            #net.to(dtype=torch.float32, device='cuda')
-            #init_net.to(dtype=torch.float32, device='cuda')
             kwargs = {'net': net, 'train_loader': train_loader, 'init_net': init_net, **kwargs}
             fn_data[i]= fn(epoch=i, kwargs=kwargs)
             net.to(dtype=torch.float32, device='cuda')
@@ -115,17 +125,30 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             "train/loss": train_loss,
             "val/accuracy": val_acc,
             "val/loss": val_loss,
-        }
+            "learning_rate": optimizer.param_groups[0]['lr'],
+        }      
+
+        if scheduler:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_val_loss = val_loss
-            #net.cpu()
-            d = {}
-            d['state_dict'] = net.state_dict()
-            file_path = os.path.join(root_path, 'best_model.pth')
-            torch.save(d, file_path)
-            #net.cuda()
+            best_state_dict = net.state_dict()
+
+            # Log artifact from memory without saving to a local file
+            
+            artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc, "epoch": i})
+            with artifact.new_file('best_model.pth', mode='wb') as f:
+                torch.save({'state_dict': best_state_dict}, f)
+            wandb.log_artifact(artifact)
+
+            wandb.run.summary["best_val_accuracy"] = best_val_acc
+            wandb.run.summary["best_val_loss"] = best_val_loss
+
             log_data["Validation Confusion Matrix"] = wandb.plot.confusion_matrix(probs=None,
                                                     y_true=val_targets, preds=val_preds,
                                                     class_names=[str(i) for i in range(10)])
@@ -135,9 +158,20 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             log_data.update(log_cnn_visuals(net, viz_images))
 
         wandb.log(log_data)
+        
+    artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "epoch": i})
+    with artifact.new_file('last_model.pth', mode='wb') as f:
+        torch.save({
+            'state_dict': net.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None
+        }, f)
+    wandb.log_artifact(artifact)
+    
 
-    checkpoint = torch.load(os.path.join(root_path, 'best_model.pth'), weights_only=True)
-    net.load_state_dict(checkpoint['state_dict'])
+    # Load the model with best val accuracy before final test evaluation.
+    if best_state_dict:
+        net.load_state_dict(best_state_dict)
 
     best_test_loss, best_test_acc, test_preds, test_targets = val_step(net, test_loader, lfn)
     
@@ -273,14 +307,16 @@ def log_cnn_visuals(net, images):
             op,ip, q, s = w.shape
             #w = w.transpose(ip, op, q, s)
             w = w.reshape(op*ip, 1, q, s)
-            grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=True)
+            if w.shape[0] > 256:
+                w = w[:256]
+            grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
             visuals[f"Images/weights/{name}"] = wandb.Image(grid_w, caption=f"Weights {name}")
             
             if name in activations:
                 act = activations[name]
                 n, ip, q, s = act.shape
                 act = act.view(n*ip, 1, q, s)
-                grid_a = vutils.make_grid(act, nrow=ip, normalize=True, scale_each=True)
+                grid_a = vutils.make_grid(act, nrow=ip, normalize=True, scale_each=False)
                 visuals[f"Images/activations/{name}"] = wandb.Image(grid_a, caption=f"Activations {name}")
     
     for h in hooks:
