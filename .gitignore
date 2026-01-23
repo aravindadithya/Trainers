@@ -4,3 +4,10 @@ checkpoints/
 data/
 # Ignore wandb local files
 wandb/
+# Ignore Python cache files
+__pycache__/
+*.pyc
+# Ignore artifacts
+artifacts/
+# Ignore nn_models
+nn_models/
