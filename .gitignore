@@ -1,0 +1,6 @@
+# Ignore all checkpoints
+checkpoints/
+# Ignore data folders
+data/
+# Ignore wandb local files
+wandb/
