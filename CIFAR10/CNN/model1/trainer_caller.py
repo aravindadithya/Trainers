@@ -82,7 +82,7 @@ def get_trained_net(run_id="1"):
     net = get_untrained_net()
     api = wandb.Api()
     try:
-        artifact = api.artifact(f"{names['project']}/model-{run_id}:latest")
+        artifact = api.artifact(f"Trainers100/{names['project']}/model-{run_id}:latest")
         model_dir = artifact.download()
         checkpoint = torch.load(os.path.join(model_dir, 'best_model.pth'), weights_only=True)
         net.load_state_dict(checkpoint['state_dict'])

@@ -40,8 +40,23 @@ def initialize_wandb(names, optimizer, lfn, net, scheduler=None):
     #TODO: REMOVE THIS KEY BEFORE PUSHING
     wandb.login(key ='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')
 
-    wandb.init(project=project, name=run_name, resume=True, id=id, config=config)
+    wandb.init(project=project, name=run_name, resume=True, id=id, config=config, entity="Trainers100")
 
+    # Define 'epoch' as the step metric for all epoch-level logs
+    wandb.define_metric("epoch")
+    metrics_to_sync = [
+        "train/accuracy", "train/loss", "val/accuracy", "val/loss",
+        "learning_rate", "Validation Confusion Matrix", "Validation Predictions",
+        "Test Confusion Matrix",
+        "Test Predictions", "fixed_val_images"
+    ]
+    for metric in metrics_to_sync:
+        wandb.define_metric(metric, step_metric="epoch")
+
+    for name, layer in net.named_modules():
+        if isinstance(layer, torch.nn.Conv2d):
+            wandb.define_metric(f"Weights_Images/{name}", step_metric="epoch")
+            wandb.define_metric(f"Activation_Images/{name}", step_metric="epoch")
 
 
 def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn,
@@ -60,32 +75,26 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     best_test_loss = 0
     best_state_dict = None
     viz_images = None
+    viz_inputs = None
 
     try:
         viz_iter = iter(val_loader)
         viz_inputs, _ = next(viz_iter)
         viz_images = viz_inputs[:20]
-        wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))]})
         viz_images = viz_images.cuda()
-        net.eval()
-        dummy_input = viz_inputs[0].unsqueeze(0).cuda()
-        artifact = wandb.Artifact(f"onnx-{names['run_id']}", type='model')
-        onnx_buffer = io.BytesIO()
-        torch.onnx.export(net, dummy_input, onnx_buffer, input_names=['input'], output_names=['output'])
-        with artifact.new_file('model.onnx', mode='wb') as f:
-            f.write(onnx_buffer.getvalue())
-        wandb.log_artifact(artifact)
-        net.train()
+        
     except Exception as e:
         print(f"Viz setup failed: {e}")
 
     start_epoch = 1
     if wandb.run.resumed:
-        start_epoch = wandb.run.summary.get("epoch", 0) + 1
+        print("Resuming from previous run...")
+        #start_epoch = wandb.run.summary.get("last_epoch", 0) + 1
         best_val_acc = wandb.run.summary.get("best_val_accuracy", 0)
         best_val_loss = wandb.run.summary.get("best_val_loss", float("inf"))
         try:
             artifact = wandb.use_artifact(f"checkpoint-{names['run_id']}:latest")
+            start_epoch = artifact.metadata.get("epoch", 0) + 1
             path = artifact.get_entry('last_model.pth').download()
             checkpoint = torch.load(path, weights_only=True)
             net.load_state_dict(checkpoint['state_dict'])
@@ -94,15 +103,28 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             if scheduler and 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             best_state_dict = checkpoint['state_dict']
-            print(f"Resumed from artifact. Best Val Acc: {best_val_acc}")
+            print(f"Best Val Acc so far in the training run: {best_val_acc}")
         except Exception as e:
             print(f"Failed to resume from artifact: {e}")
     else:
+        if viz_images is not None:
+            wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))], "epoch": 0})
+
         # Log initial weights for new runs
         artifact = wandb.Artifact(f"init-weights-{names['run_id']}", type='model', metadata={"epoch": 0})
         with artifact.new_file('init_model.pth', mode='wb') as f:
             torch.save({'state_dict': net.state_dict()}, f)
         wandb.log_artifact(artifact)
+        net.eval()
+        if viz_inputs is not None:
+            dummy_input = viz_inputs[0].unsqueeze(0).cuda()
+            artifact = wandb.Artifact(f"onnx-{names['run_id']}", type='model')
+            onnx_buffer = io.BytesIO()
+            torch.onnx.export(net, dummy_input, onnx_buffer, input_names=['input'], output_names=['output'])
+            with artifact.new_file('model.onnx', mode='wb') as f:
+                f.write(onnx_buffer.getvalue())
+            wandb.log_artifact(artifact)
+        net.train()
 
     for i in range(start_epoch, start_epoch + num_epochs):
 
@@ -159,7 +181,7 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
 
         wandb.log(log_data)
         
-    artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "epoch": i})
+    artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
     with artifact.new_file('last_model.pth', mode='wb') as f:
         torch.save({
             'state_dict': net.state_dict(),
@@ -167,22 +189,25 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None
         }, f)
     wandb.log_artifact(artifact)
+    wandb.run.summary["best_val_accuracy"] = best_val_acc
+    wandb.run.summary["best_val_loss"] = best_val_loss
     
+
 
     # Load the model with best val accuracy before final test evaluation.
     if best_state_dict:
         net.load_state_dict(best_state_dict)
 
     best_test_loss, best_test_acc, test_preds, test_targets = val_step(net, test_loader, lfn)
-    
     wandb.run.summary["best_test_accuracy"] = best_test_acc
     wandb.run.summary["best_test_loss"] = best_test_loss
-    wandb.run.summary["best_val_accuracy"] = best_val_acc
-    wandb.run.summary["best_val_loss"] = best_val_loss
+    
+    
+
     wandb.log({"Test Confusion Matrix": wandb.plot.confusion_matrix(probs=None,
                                                             y_true=test_targets, preds=test_preds,
-                                                            class_names=[str(i) for i in range(10)])})
-    wandb.log({"Test Predictions": log_predictions_table(net, test_loader, limit=256)})
+                                                            class_names=[str(i) for i in range(10)]), "epoch": i})
+    wandb.log({"Test Predictions": log_predictions_table(net, test_loader, limit=256), "epoch": i})
     wandb.finish()
     
     print("FINISHED TRAINING :)")
@@ -228,7 +253,7 @@ def train_step(net, optimizer, lfn, train_loader):
         scaler.step(optimizer)    
         scaler.update() 
 
-        wandb.log({"batch/loss": loss.item()})               
+        wandb.log({"Batch/loss": loss.item()})               
         train_loss += loss.detach().item() * len(inputs)
         
         _, predicted = torch.max(output.data, 1)
@@ -310,14 +335,14 @@ def log_cnn_visuals(net, images):
             if w.shape[0] > 256:
                 w = w[:256]
             grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
-            visuals[f"Images/weights/{name}"] = wandb.Image(grid_w, caption=f"Weights {name}")
+            visuals[f"Weights_Images/{name}"] = wandb.Image(grid_w, caption=f"Weights_Images {name}")
             
             if name in activations:
                 act = activations[name]
                 n, ip, q, s = act.shape
                 act = act.view(n*ip, 1, q, s)
                 grid_a = vutils.make_grid(act, nrow=ip, normalize=True, scale_each=False)
-                visuals[f"Images/activations/{name}"] = wandb.Image(grid_a, caption=f"Activations {name}")
+                visuals[f"Activation_Images/{name}"] = wandb.Image(grid_a, caption=f"Activations_Images {name}")
     
     for h in hooks:
         h.remove()
