@@ -1,12 +1,9 @@
 
 import torch
-import torch.nn.functional as F
-import torch.onnx
-import torchvision.utils as vutils
 import wandb
 import time
-import io
 from torch.amp import autocast
+from utils.special_logger import CNNLogger, BaseLogger
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
@@ -15,116 +12,27 @@ Optimization: All the specialized logs like log_cnn_visuals
 can be merged into val_step. This affects readability but improves speed.
 ''' 
 
-def initialize_wandb(names, optimizer, lfn, net, scheduler=None):
-    
-    project = names['project']
-    run_name = names['name']
-    id = names['run_id']
-
-    # Extracting config details
-    config = { 
-        "project": project,
-        "run_name": run_name,
-        "run_id": id,
-        "learning_rate": optimizer.param_groups[0]['lr'],
-        "optimizer": type(optimizer).__name__,
-        "loss_function": type(lfn).__name__,
-        #"epochs": num_epochs,
-        "model_architecture": type(net).__name__,
-        "model_structure": str(net),
-        "num_parameters": sum(p.numel() for p in net.parameters()),
-        "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
-        "scheduler": type(scheduler).__name__ if scheduler else "None",
-    }
-
-    #TODO: REMOVE THIS KEY BEFORE PUSHING
-    wandb.login(key ='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')
-
-    wandb.init(project=project, name=run_name, resume=True, id=id, config=config, entity="Trainers100")
-
-    # Define 'epoch' as the step metric for all epoch-level logs
-    wandb.define_metric("epoch")
-    metrics_to_sync = [
-        "train/accuracy", "train/loss", "val/accuracy", "val/loss",
-        "learning_rate", "Validation Confusion Matrix", "Validation Predictions",
-        "Test Confusion Matrix",
-        "Test Predictions", "fixed_val_images"
-    ]
-    for metric in metrics_to_sync:
-        wandb.define_metric(metric, step_metric="epoch")
-
-    for name, layer in net.named_modules():
-        if isinstance(layer, torch.nn.Conv2d):
-            wandb.define_metric(f"Weights_Images/{name}", step_metric="epoch")
-            wandb.define_metric(f"Activation_Images/{name}", step_metric="epoch")
-
 
 def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn,
                   scheduler=None, names=None, num_epochs = 5, fn=None, kwargs={}):
 
 
     
-    print("Initializing Wandb:")
-    initialize_wandb(names, optimizer, lfn, net, scheduler)
 
     net.cuda()
+    print("Initializing Wandb:")
+    logger = BaseLogger(names, optimizer, lfn, net, scheduler, val_loader)
+
+    
     wandb.watch(net, log="all", log_freq=10, idx=0)
-    best_val_acc = 0
     best_test_acc = 0
-    best_val_loss = float("inf")
     best_test_loss = 0
-    best_state_dict = None
-    viz_images = None
-    viz_inputs = None
 
-    try:
-        viz_iter = iter(val_loader)
-        viz_inputs, _ = next(viz_iter)
-        viz_images = viz_inputs[:20]
-        viz_images = viz_images.cuda()
-        
-    except Exception as e:
-        print(f"Viz setup failed: {e}")
-
-    start_epoch = 1
-    if wandb.run.resumed:
-        print("Resuming from previous run...")
-        #start_epoch = wandb.run.summary.get("last_epoch", 0) + 1
-        best_val_acc = wandb.run.summary.get("best_val_accuracy", 0)
-        best_val_loss = wandb.run.summary.get("best_val_loss", float("inf"))
-        try:
-            artifact = wandb.use_artifact(f"checkpoint-{names['run_id']}:latest")
-            start_epoch = artifact.metadata.get("epoch", 0) + 1
-            path = artifact.get_entry('last_model.pth').download()
-            checkpoint = torch.load(path, weights_only=True)
-            net.load_state_dict(checkpoint['state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if scheduler and 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            best_state_dict = checkpoint['state_dict']
-            print(f"Best Val Acc so far in the training run: {best_val_acc}")
-        except Exception as e:
-            print(f"Failed to resume from artifact: {e}")
-    else:
-        if viz_images is not None:
-            wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(viz_images[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(viz_images))], "epoch": 0})
-
-        # Log initial weights for new runs
-        artifact = wandb.Artifact(f"init-weights-{names['run_id']}", type='model', metadata={"epoch": 0})
-        with artifact.new_file('init_model.pth', mode='wb') as f:
-            torch.save({'state_dict': net.state_dict()}, f)
-        wandb.log_artifact(artifact)
-        net.eval()
-        if viz_inputs is not None:
-            dummy_input = viz_inputs[0].unsqueeze(0).cuda()
-            artifact = wandb.Artifact(f"onnx-{names['run_id']}", type='model')
-            onnx_buffer = io.BytesIO()
-            torch.onnx.export(net, dummy_input, onnx_buffer, input_names=['input'], output_names=['output'])
-            with artifact.new_file('model.onnx', mode='wb') as f:
-                f.write(onnx_buffer.getvalue())
-            wandb.log_artifact(artifact)
-        net.train()
+    start_epoch = logger.start_epoch
+    best_val_acc = logger.best_val_acc
+    best_val_loss = logger.best_val_loss
+    best_state_dict = logger.best_state_dict
+    inputs = logger.inputs
 
     for i in range(start_epoch, start_epoch + num_epochs):
 
@@ -136,9 +44,9 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             net.to(dtype=torch.float32, device='cuda')
             init_net.to(dtype=torch.float32, device='cpu')
 
-        #Train loss and accuracy are calculated on the fly during training
+        #Train loss and accuracy are calculated on the fly during backprob for each epoch
         train_loss, train_acc = train_step(net, optimizer, lfn, train_loader)
-        # Validation loss and accuracy are calculated after each epoch
+        # Validation loss and accuracy are calculated after backprob for each epoch
         val_loss, val_acc, val_preds, val_targets = val_step(net, val_loader, lfn)       
 
         log_data = {
@@ -161,23 +69,23 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
             best_val_loss = val_loss
             best_state_dict = net.state_dict()
 
-            # Log artifact from memory without saving to a local file
-            
+            # Log wandb artifact from memory without saving to a local file      
             artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc, "epoch": i})
             with artifact.new_file('best_model.pth', mode='wb') as f:
                 torch.save({'state_dict': best_state_dict}, f)
             wandb.log_artifact(artifact)
-
             wandb.run.summary["best_val_accuracy"] = best_val_acc
             wandb.run.summary["best_val_loss"] = best_val_loss
+            
+            logger.log_confusion_matrix(y_true=val_targets, preds=val_preds,
+                                        epoch=i, class_names=[str(i) for i in range(10)],
+                                        log_key="Validation Confusion Matrix")
 
-            log_data["Validation Confusion Matrix"] = wandb.plot.confusion_matrix(probs=None,
-                                                    y_true=val_targets, preds=val_preds,
-                                                    class_names=[str(i) for i in range(10)])
-            log_data["Validation Predictions"] = log_predictions_table(net, val_loader, limit=256)
-        
-        if names['type'] == 'CNN' and viz_images is not None:
-            log_data.update(log_cnn_visuals(net, viz_images))
+            logger.log_predictions_table(net, val_loader, epoch=i, log_key="Validation Predictions", limit=256)
+
+            #Specialized layer logs
+            if inputs is not None:
+                specialized_visuals_dispatcher(net, inputs, epoch=i)
 
         wandb.log(log_data)
         
@@ -194,7 +102,8 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     
 
 
-    # Load the model with best val accuracy before final test evaluation.
+    # Load the model with best val accuracy before final test evaluation. 
+    # Currently the weights are being taken from checkpoint
     if best_state_dict:
         net.load_state_dict(best_state_dict)
 
@@ -202,13 +111,12 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     wandb.run.summary["best_test_accuracy"] = best_test_acc
     wandb.run.summary["best_test_loss"] = best_test_loss
     
-    
+    logger.log_confusion_matrix(y_true=test_targets, preds=test_preds,
+                                epoch=i, class_names=[str(i) for i in range(10)],
+                                log_key="Test Confusion Matrix")
 
-    wandb.log({"Test Confusion Matrix": wandb.plot.confusion_matrix(probs=None,
-                                                            y_true=test_targets, preds=test_preds,
-                                                            class_names=[str(i) for i in range(10)]), "epoch": i})
-    wandb.log({"Test Predictions": log_predictions_table(net, test_loader, limit=256), "epoch": i})
-    wandb.finish()
+    logger.log_predictions_table(net, test_loader, epoch=i, log_key="Test Predictions", limit=256)
+    logger.finish()
     
     print("FINISHED TRAINING :)")
 
@@ -308,7 +216,19 @@ def val_step(net, val_loader, lfn):
     val_acc = 100 * correct / total
     return val_loss, val_acc, all_preds, all_targets
 
-def log_cnn_visuals(net, images):
+
+
+def specialized_visuals_dispatcher(net, inputs, epoch):
+    """
+    Dispatches to specialized visual loggers based on model type.
+    This function uses a generic hook-based mechanism to capture and log layer details.
+    """
+    layer_handlers = {}
+    layer_handlers[torch.nn.Conv2d] = CNNLogger(100, 100)
+
+    if not layer_handlers:
+        return
+
     net.eval()
     activations = {}
     hooks = []
@@ -319,84 +239,20 @@ def log_cnn_visuals(net, images):
         return hook
 
     for name, layer in net.named_modules():
-        if isinstance(layer, torch.nn.Conv2d):
+        if type(layer) in layer_handlers:
             hooks.append(layer.register_forward_hook(get_activation(name)))
 
     with torch.no_grad():
-        net(images)
+        net(inputs)
 
-    visuals = {}
     for name, layer in net.named_modules():
-        if isinstance(layer, torch.nn.Conv2d):
-            w = layer.weight.data
-            op,ip, q, s = w.shape
-            #w = w.transpose(ip, op, q, s)
-            w = w.reshape(op*ip, 1, q, s)
-            if w.shape[0] > 256:
-                w = w[:256]
-            grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
-            visuals[f"Weights_Images/{name}"] = wandb.Image(grid_w, caption=f"Weights_Images {name}")
-            
-            if name in activations:
-                act = activations[name]
-                n, ip, q, s = act.shape
-                act = act.view(n*ip, 1, q, s)
-                grid_a = vutils.make_grid(act, nrow=ip, normalize=True, scale_each=False)
-                visuals[f"Activation_Images/{name}"] = wandb.Image(grid_a, caption=f"Activations_Images {name}")
+        if type(layer) in layer_handlers:
+            handler = layer_handlers[type(layer)]
+            activation = activations.get(name)
+            handler.call(layer, name, activation, epoch)
     
     for h in hooks:
         h.remove()
-        
-    return visuals
-
-
-def log_predictions_table(net, loader, limit=None):
-    net.eval()
-    columns = ["Image", "Ground Truth", "Prediction", "Confidence"] + [f"Score_{i}" for i in range(10)]
-    table = wandb.Table(columns=columns)
-    
-    count = 0
-    with torch.no_grad():
-        for batch in loader:
-            inputs, targets = batch
-            inputs = inputs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-            
-            with autocast(device_type='cuda'):
-                outputs = net(inputs)
-                probs = F.softmax(outputs, dim=1)
-            
-            confidences, preds = torch.max(probs, 1)
-            
-            if len(targets.size()) > 1:
-                _, targets_idx = torch.max(targets, -1)
-            else:
-                targets_idx = targets
-                
-            inputs_cpu = inputs.cpu()
-            targets_cpu = targets_idx.cpu()
-            preds_cpu = preds.cpu()
-            confidences_cpu = confidences.cpu()
-            probs_cpu = probs.cpu()
-            
-            for j in range(len(inputs)):
-                if limit is not None and count >= limit:
-                    return table
-                
-                if preds_cpu[j] == targets_cpu[j]:
-                    continue
-
-                img = inputs_cpu[j]
-                #TODO: Handle the case when image is given as 1D tensor properly.
-                if img.dim() == 1:
-                    img = img.view(1, 28, 28)
-                
-                img_viz = vutils.make_grid(img, normalize=True)
-                row = [wandb.Image(img_viz), str(targets_cpu[j].item()), str(preds_cpu[j].item()), confidences_cpu[j].item()]
-                row.extend(probs_cpu[j].tolist())
-                table.add_data(*row)
-                count += 1
-    return table
 
 
 '''

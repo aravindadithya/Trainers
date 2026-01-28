@@ -75,6 +75,9 @@ def get_acc_ce(net, loader):
 #GET NET
 def get_untrained_net():
     net = torchvision.models.resnet18(weights=None)
+    # Modify the model for CIFAR-10.
+    net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    net.maxpool = nn.Identity()
     net.fc = nn.Linear(net.fc.in_features, 10)
     return net
 
