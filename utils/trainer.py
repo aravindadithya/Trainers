@@ -13,20 +13,21 @@ can be merged into val_step. This affects readability but improves speed.
 ''' 
 
 
-def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn,
-                  scheduler=None, names=None, num_epochs = 5, fn=None, kwargs={}):
+def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
+                  scheduler=None, names=None, num_epochs = 5):
 
     # Allow PyTorch to use the TensorFloat32 (TF32) tensor cores on Ampere and newer GPUs
     # for better performance with float32 matrix multiplications.
     torch.set_float32_matmul_precision('high')
 
-
-    
-
     net.cuda()
     # Optimization: Use Channels Last memory format for faster CNNs on Tensor Cores
     net = net.to(memory_format=torch.channels_last)
+
+    # This is supposed to improve performance but I found mixed results 
+    # with diminisghing returns
     #net = torch.compile(net)
+
     print("Initializing Wandb:")
     logger = BaseLogger(names, optimizer, lfn, net, scheduler, val_loader)
 
@@ -44,13 +45,6 @@ def train_network(train_loader, val_loader, test_loader, net, init_net, optimize
     for i in range(start_epoch, start_epoch + num_epochs):
 
         print("EPOCH: ", i)
-
-        if fn is not None:
-            kwargs = {'net': net, 'train_loader': train_loader, 'init_net': init_net, **kwargs}
-            fn_data[i]= fn(epoch=i, kwargs=kwargs)
-            net.to(dtype=torch.float32, device='cuda')
-            init_net.to(dtype=torch.float32, device='cpu')
-
         #Train loss and accuracy are calculated on the fly during backprob for each epoch
         train_loss, train_acc = train_step(net, optimizer, lfn, train_loader)
         # Validation loss and accuracy are calculated after backprob for each epoch
@@ -171,10 +165,7 @@ def train_step(net, optimizer, lfn, train_loader):
         scaler.step(optimizer)    
         scaler.update() 
 
-        # Accumulate loss on GPU
         train_loss_accum += loss.detach() * inputs.size(0)
-
-        # Log every 10 batches to reduce synchronization overhead while keeping some visibility
         # Note: loss.item() triggers a CPU-GPU sync
         if batch_idx % 10 == 0:
             wandb.log({"Batch/loss": loss.item()})
@@ -197,7 +188,6 @@ def train_step(net, optimizer, lfn, train_loader):
 def val_step(net, val_loader, lfn):
     global scaler
     net.eval()
-    # Optimization: Accumulate on GPU to avoid CPU-GPU sync in the loop
     val_loss_accum = torch.tensor(0.0, device='cuda')
     correct_accum = torch.tensor(0.0, device='cuda')
     total = 0
@@ -215,7 +205,6 @@ def val_step(net, val_loader, lfn):
                 output = net(inputs)
                 loss = lfn(output, target)
             
-            # Accumulate loss on GPU
             val_loss_accum += loss.detach() * inputs.size(0)
             
             _, predicted = torch.max(output.data, 1)
@@ -225,17 +214,12 @@ def val_step(net, val_loader, lfn):
             else:
                 labels_idx = target
             
-            # Accumulate accuracy on GPU
             correct_accum += (predicted == labels_idx).sum()
-            
-            # Defer CPU transfer: Collect tensors and move them all at once at the end
             all_preds.append(predicted)
             all_targets.append(labels_idx)
         
     val_loss = val_loss_accum.item() / len(val_loader.dataset)
     val_acc = 100 * correct_accum.item() / total
-    
-    # Concatenate and move to CPU once per epoch instead of per batch
     all_preds = torch.cat(all_preds).cpu().tolist()
     all_targets = torch.cat(all_targets).cpu().tolist()
     

@@ -4,10 +4,13 @@ import torchvision.utils as vutils
 import torch.nn.functional as F
 from torch.amp import autocast
 import io
+import os
 
 
 class BaseLogger:
+
     def __init__(self, names, optimizer, lfn, net, scheduler=None, val_loader=None):
+        
         self.names = names
         self.optimizer = optimizer
         self.lfn = lfn
@@ -27,6 +30,7 @@ class BaseLogger:
             self._resume_run()
         else:
             self._log_initial_artifacts(self.inputs)
+
     def _initialize_wandb(self, names, optimizer, lfn, net, scheduler=None):
         project = names['project']
         run_name = names['name']
@@ -47,8 +51,7 @@ class BaseLogger:
             "scheduler": type(scheduler).__name__ if scheduler else "None",
         }
 
-        #TODO: REMOVE THIS KEY BEFORE PUSHING
-        wandb.login(key='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')
+        wandb.login(key=os.getenv('WANDB_API_KEY'))
 
         wandb.init(project=project, name=run_name, resume="allow", id=id, config=config, entity="Trainers100")
 
@@ -88,19 +91,31 @@ class BaseLogger:
         self.best_val_acc = wandb.run.summary.get("best_val_accuracy", 0)
         self.best_val_loss = wandb.run.summary.get("best_val_loss", float("inf"))
         try:
+            # Load checkpoint to resume training state
             artifact = wandb.use_artifact(f"checkpoint-{self.names['run_id']}:latest")
             self.start_epoch = artifact.metadata.get("epoch", 0) + 1
             path = artifact.get_entry('last_model.pth').download()
             checkpoint = torch.load(path, weights_only=True)
             self.net.load_state_dict(checkpoint['state_dict'])
+
             if 'optimizer_state_dict' in checkpoint and self.optimizer:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint and self.scheduler:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.best_state_dict = checkpoint['state_dict']
+
+            # Load the state dict from the model with the best validation accuracy
+            try:
+                best_model_artifact = wandb.use_artifact(f"model-{self.names['run_id']}:latest")
+                best_model_path = best_model_artifact.get_entry('best_model.pth').download()
+                best_model_checkpoint = torch.load(best_model_path, weights_only=True)
+                self.best_state_dict = best_model_checkpoint['state_dict']
+            except Exception:
+                # This is expected if no "best model" has been saved yet.
+                pass
+
             print(f"Best Val Acc so far in the training run: {self.best_val_acc}")
         except Exception as e:
-            print(f"Failed to resume from artifact: {e}")
+            print(f"Failed to resume from checkpoint artifact: {e}")
 
     def _log_initial_artifacts(self, inputs):
         if inputs is not None:
@@ -191,6 +206,7 @@ class BaseLogger:
 
 
 class CNNLogger:
+
     def __init__(self, image_limits=100, weight_limits=100):
         self.image_limits = image_limits
         self.weight_limits = weight_limits

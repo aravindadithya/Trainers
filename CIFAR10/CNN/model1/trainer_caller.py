@@ -18,7 +18,7 @@ names = {'project':'CIFAR10', 'type':'CNN'}
 # ACCESS LOADERS
 def get_loaders():
 
-    SEED = 5700
+    SEED = 7500
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     torch.backends.cudnn.deterministic = False
@@ -98,11 +98,10 @@ def get_trained_net(run_id="1"):
         print(f"Error loading from WandB: {e}")
     return net
 
-def train_net(run_id="1", epochs=10, fn=None, kwargs={}):
+def train_net(run_id="1", epochs=10):
 
     net = get_untrained_net()
-    init_net = deepcopy(net)
-    
+     
     trainloader, valloader, testloader = get_loaders() 
     names['run_id']= run_id
     names['name']= f"{model_name}"
@@ -111,10 +110,10 @@ def train_net(run_id="1", epochs=10, fn=None, kwargs={}):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     t.train_network(trainloader, valloader, testloader,
-                    optimizer=optimizer,
-                    lfn=  nn.CrossEntropyLoss(), 
-                    num_epochs = epochs,
-                    names=names, net=net, init_net= init_net, scheduler=scheduler, fn=fn, kwargs=kwargs)
+                    optimizer= optimizer,
+                    lfn= nn.CrossEntropyLoss(), 
+                    num_epochs= epochs,
+                    names= names, net= net, scheduler= scheduler)
            
     
     
