@@ -1,0 +1,23 @@
+{
+    // 1. REPLICATE INTERPRETER & PATHS
+    "python.defaultInterpreterPath": "/venv/main/bin/python",
+    "python.analysis.extraPaths": ["${workspaceFolder}"],
+    "python.autoComplete.extraPaths": ["${workspaceFolder}"],
+
+    // 2. REPLICATE remoteEnv (For the Integrated Terminal)
+    "terminal.integrated.env.linux": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PATH": "/venv/main/bin/:${env:PATH}"
+    },
+
+    // 3. REPLICATE runArgs / Terminal behavior
+    "terminal.integrated.cwd": "${workspaceFolder}",
+
+    // 4. REPLICATE Extensions (Force SSH to use these)
+    "remote.SSH.defaultExtensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-python.vscode-pylance",
+        "google.geminicodeassist"
+    ]
+}
