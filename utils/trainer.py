@@ -16,15 +16,22 @@ can be merged into val_step. This affects readability but improves speed.
 def train_network(train_loader, val_loader, test_loader, net, init_net, optimizer, lfn,
                   scheduler=None, names=None, num_epochs = 5, fn=None, kwargs={}):
 
+    # Allow PyTorch to use the TensorFloat32 (TF32) tensor cores on Ampere and newer GPUs
+    # for better performance with float32 matrix multiplications.
+    torch.set_float32_matmul_precision('high')
+
 
     
 
     net.cuda()
+    # Optimization: Use Channels Last memory format for faster CNNs on Tensor Cores
+    net = net.to(memory_format=torch.channels_last)
+    #net = torch.compile(net)
     print("Initializing Wandb:")
     logger = BaseLogger(names, optimizer, lfn, net, scheduler, val_loader)
 
     
-    wandb.watch(net, log="all", log_freq=10, idx=0)
+    wandb.watch(net, log="all", log_freq=100, idx=0)
     best_test_acc = 0
     best_test_loss = 0
 
@@ -140,16 +147,19 @@ def train_step(net, optimizer, lfn, train_loader):
     global scaler
     net.train()
     start = time.time()
-    train_loss = 0.
-    correct = 0
+    # Accumulate on GPU to avoid CPU-GPU sync in the loop
+    train_loss_accum = torch.tensor(0.0, device='cuda')
+    correct_accum = torch.tensor(0.0, device='cuda')
     total = 0
 
     for batch_idx, batch in enumerate(train_loader):
-        optimizer.zero_grad()
+        # Optimization: set_to_none=True skips zeroing the memory, which is faster
+        optimizer.zero_grad(set_to_none=True)
         inputs, labels = batch
         targets = labels
         
-        inputs = inputs.cuda(non_blocking=True)
+        # Optimization: Channels Last for inputs matches the model layout
+        inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True)
         target = targets.cuda(non_blocking=True)
 
         with autocast(device_type='cuda'):
@@ -161,8 +171,13 @@ def train_step(net, optimizer, lfn, train_loader):
         scaler.step(optimizer)    
         scaler.update() 
 
-        wandb.log({"Batch/loss": loss.item()})               
-        train_loss += loss.detach().item() * len(inputs)
+        # Accumulate loss on GPU
+        train_loss_accum += loss.detach() * inputs.size(0)
+
+        # Log every 10 batches to reduce synchronization overhead while keeping some visibility
+        # Note: loss.item() triggers a CPU-GPU sync
+        if batch_idx % 10 == 0:
+            wandb.log({"Batch/loss": loss.item()})
         
         _, predicted = torch.max(output.data, 1)
         total += target.size(0)
@@ -170,20 +185,21 @@ def train_step(net, optimizer, lfn, train_loader):
             _, labels_idx = torch.max(target, -1)
         else:
             labels_idx = target
-        correct += (predicted == labels_idx).sum().item()
+        correct_accum += (predicted == labels_idx).sum()
         
     end = time.time()
     print("Time: ", end - start)
-    train_loss = train_loss / len(train_loader.dataset)
-    train_acc = 100 * correct / total
+    train_loss = train_loss_accum.item() / len(train_loader.dataset)
+    train_acc = 100 * correct_accum.item() / total
     return train_loss, train_acc
 
 
 def val_step(net, val_loader, lfn):
     global scaler
     net.eval()
-    val_loss = 0.
-    correct = 0
+    # Optimization: Accumulate on GPU to avoid CPU-GPU sync in the loop
+    val_loss_accum = torch.tensor(0.0, device='cuda')
+    correct_accum = torch.tensor(0.0, device='cuda')
     total = 0
     all_preds = []
     all_targets = []
@@ -191,15 +207,16 @@ def val_step(net, val_loader, lfn):
     for batch_idx, batch in enumerate(val_loader):
         inputs, labels = batch
         targets = labels
-        inputs = inputs.cuda(non_blocking=True) 
+        inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True) 
         target = targets.cuda(non_blocking=True)
         
         with torch.no_grad():
             with autocast(device_type='cuda'): 
                 output = net(inputs)
                 loss = lfn(output, target)
-                
-            val_loss += loss.detach().item() * len(inputs)
+            
+            # Accumulate loss on GPU
+            val_loss_accum += loss.detach() * inputs.size(0)
             
             _, predicted = torch.max(output.data, 1)
             total += target.size(0)
@@ -207,13 +224,21 @@ def val_step(net, val_loader, lfn):
                 _, labels_idx = torch.max(target, -1)
             else:
                 labels_idx = target
-            correct += (predicted == labels_idx).sum().item()
             
-            all_preds.extend(predicted.tolist())
-            all_targets.extend(labels_idx.tolist())
+            # Accumulate accuracy on GPU
+            correct_accum += (predicted == labels_idx).sum()
+            
+            # Defer CPU transfer: Collect tensors and move them all at once at the end
+            all_preds.append(predicted)
+            all_targets.append(labels_idx)
         
-    val_loss = val_loss / len(val_loader.dataset)
-    val_acc = 100 * correct / total
+    val_loss = val_loss_accum.item() / len(val_loader.dataset)
+    val_acc = 100 * correct_accum.item() / total
+    
+    # Concatenate and move to CPU once per epoch instead of per batch
+    all_preds = torch.cat(all_preds).cpu().tolist()
+    all_targets = torch.cat(all_targets).cpu().tolist()
+    
     return val_loss, val_acc, all_preds, all_targets
 
 

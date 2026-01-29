@@ -21,8 +21,8 @@ def get_loaders():
     SEED = 5700
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     
     means = (0.4914, 0.4822, 0.4465)
     transform_train = transforms.Compose([
@@ -59,7 +59,8 @@ def get_acc_ce(net, loader):
     total = 0
     with torch.no_grad():
         for inputs, targets in loader:
-            inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)  # Move to CUDA consistently
+            inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
             with autocast(device_type='cuda'):
                outputs = net(inputs)
             _, predicted = torch.max(outputs.data, 1)  # Get predicted classes
@@ -79,6 +80,8 @@ def get_untrained_net():
     net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     net.maxpool = nn.Identity()
     net.fc = nn.Linear(net.fc.in_features, 10)
+    #Channels last is faster for ConvNets on GPU
+    net = net.to(memory_format=torch.channels_last)
     return net
 
 def get_trained_net(run_id="1"):
@@ -99,6 +102,7 @@ def train_net(run_id="1", epochs=10, fn=None, kwargs={}):
 
     net = get_untrained_net()
     init_net = deepcopy(net)
+    
     trainloader, valloader, testloader = get_loaders() 
     names['run_id']= run_id
     names['name']= f"{model_name}"

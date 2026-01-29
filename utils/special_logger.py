@@ -211,7 +211,7 @@ class CNNLogger:
         if activation is not None:
             act = activation
             n, ip_act, q_act, s_act = act.shape
-            act = act.view(n * ip_act, 1, q_act, s_act)
+            act = act.reshape(n * ip_act, 1, q_act, s_act)
             grid_a = vutils.make_grid(act, nrow=ip_act, normalize=True, scale_each=False)
             visuals[f"Activation_Images/{layer_name}"] = wandb.Image(grid_a, caption=f"Activations_Images {layer_name}")
         
