@@ -13,7 +13,7 @@
         "PYTHONPATH": "${containerWorkspaceFolder}",
         "PATH": "/venv/main/bin/:${containerEnv:PATH}"
     },
-
+    
     "customizations": {
         "vscode": {
             "extensions": [
@@ -25,12 +25,25 @@
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/venv/main/bin/python",
-                // Ensures terminal starts at your code root
                 "terminal.integrated.cwd": "${containerWorkspaceFolder}",
-                // Helps Pylance (IntelliSense) see your modules
-                "python.analysis.extraPaths": ["${containerWorkspaceFolder}"]
-            }
-        }
+                "python.analysis.extraPaths": ["${containerWorkspaceFolder}"],
+                "python.analysis.indexing": false,
+                "python.analysis.diagnosticMode": "openFilesOnly",
+                "python.analysis.typeCheckingMode": "off",
+                "python.analysis.exclude": [
+                                                "**/venv/**", 
+                                                "**/.git/**", 
+                                                "**/datasets/**", 
+                                                "**/wandb/**",
+                                                "**/outputs/**"
+                                            ],
+                "files.watcherExclude": {
+                                                "**/venv/**": true,
+                                                "**/datasets/**": true,
+                                                "**/.git/**": true
+                                       }
+                        }
+                }
     },
 
     "postCreateCommand": "apt-get update && apt-get install -y tmux git-lfs && /venv/main/bin/python -m pip install --upgrade pip && if [ -f ${containerWorkspaceFolder}/requirements.txt ]; then /venv/main/bin/python -m pip install -r ${containerWorkspaceFolder}/requirements.txt; fi",
