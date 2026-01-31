@@ -13,11 +13,11 @@ can be merged into val_step. This affects readability but improves speed.
 ''' 
 
 
+
 def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
                   scheduler=None, names=None, num_epochs = 5):
 
-    # Allow PyTorch to use the TensorFloat32 (TF32) tensor cores on Ampere and newer GPUs
-    # for better performance with float32 matrix multiplications.
+   
     torch.set_float32_matmul_precision('high')
 
     net.cuda()
@@ -25,7 +25,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     net = net.to(memory_format=torch.channels_last)
 
     # This is supposed to improve performance but I found mixed results 
-    # with diminisghing returns
+    # with diminishing returns
     #net = torch.compile(net)
 
     print("Initializing Wandb:")
@@ -79,28 +79,24 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
             wandb.run.summary["best_val_loss"] = best_val_loss
             
             logger.log_confusion_matrix(y_true=val_targets, preds=val_preds,
-                                        epoch=i, class_names=[str(i) for i in range(10)],
+                                        epoch=i, class_names=[str(c) for c in range(10)],
                                         log_key="Validation Confusion Matrix")
 
             logger.log_predictions_table(net, val_loader, epoch=i, log_key="Validation Predictions", limit=256)
-
-            #Specialized layer logs
             if inputs is not None:
                 specialized_visuals_dispatcher(net, inputs, epoch=i)
 
+        if i % 10 == 0:
+            artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
+            with artifact.new_file('last_model.pth', mode='wb') as f:
+                torch.save({
+                    'state_dict': net.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None
+                }, f)
+            wandb.log_artifact(artifact)
+
         wandb.log(log_data)
-        
-    artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
-    with artifact.new_file('last_model.pth', mode='wb') as f:
-        torch.save({
-            'state_dict': net.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None
-        }, f)
-    wandb.log_artifact(artifact)
-    wandb.run.summary["best_val_accuracy"] = best_val_acc
-    wandb.run.summary["best_val_loss"] = best_val_loss
-    
 
 
     # Load the model with best val accuracy before final test evaluation. 

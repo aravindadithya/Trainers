@@ -1,7 +1,7 @@
 {
     "name": "Torch Dev Container",
     "image": "vastai/pytorch:cuda-12.4.1-auto",
-    "workspaceFolder": "/workspaces", // Explicitly sets the root
+    "workspaceFolder": "/workspaces", 
     
     "runArgs": [
         "--gpus", "all",
@@ -9,7 +9,6 @@
     ],
 
     "remoteEnv": {
-        // This adds your project root to the Python import search path
         "PYTHONPATH": "${containerWorkspaceFolder}",
         "PATH": "/venv/main/bin/:${containerEnv:PATH}"
     },

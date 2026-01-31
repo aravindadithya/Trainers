@@ -102,9 +102,8 @@ class BaseLogger:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint and self.scheduler:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-            # Load the state dict from the model with the best validation accuracy
             try:
+                # Load the state dict from the model with the best validation accuracy
                 best_model_artifact = wandb.use_artifact(f"model-{self.names['run_id']}:latest")
                 best_model_path = best_model_artifact.get_entry('best_model.pth').download()
                 best_model_checkpoint = torch.load(best_model_path, weights_only=True)
