@@ -6,12 +6,14 @@ from torch.amp import autocast
 import torch.nn as nn
 from utils import trainer as t
 import wandb
+import model
+
 
 workspaces_path= os.getenv('PYTHONPATH')
 print(f"Current Path: {workspaces_path}")
 
-model_name = 'CIFAR10/CNN/model1'
-names = {'project':'CIFAR10', 'type':'CNN'}
+model_name = os.getcwd()
+names = {'project':'CIFAR10'}
 
 
 # ACCESS LOADERS
@@ -74,11 +76,7 @@ def get_acc_ce(net, loader):
 
 #GET NET
 def get_untrained_net():
-    net = torchvision.models.resnet18(weights=None)
-    # Modify the model for CIFAR-10.
-    net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    net.maxpool = nn.Identity()
-    net.fc = nn.Linear(net.fc.in_features, 10)
+    net = model.ResNet18()
     #Channels last is faster for ConvNets on GPU
     net = net.to(memory_format=torch.channels_last)
     return net
@@ -97,6 +95,29 @@ def get_trained_net(run_id="1"):
         print(f"Error loading from WandB: {e}")
     return net
 
+def cleanup_artifacts(run_id):
+    api = wandb.Api()
+    # Entity is hardcoded in special_logger.py
+    entity = "Trainers100"
+    project = names['project']
+
+    # Cleanup models: Keep latest
+    try:
+        versions = api.artifact_versions("model", f"{entity}/{project}/model-{run_id}")
+        for v in versions:
+            if 'latest' not in v.aliases:
+                v.delete()
+    except Exception:
+        pass
+
+    # Cleanup checkpoints: Delete all
+    try:
+        versions = api.artifact_versions("model", f"{entity}/{project}/checkpoint-{run_id}")
+        for v in versions:
+            v.delete()
+    except Exception:
+        pass
+
 def train_net(run_id="1", epochs=10):
 
     net = get_untrained_net()
@@ -106,7 +127,9 @@ def train_net(run_id="1", epochs=10):
     names['name']= f"{model_name}"
 
     optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)
+    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer)
+    
 
     t.train_network(trainloader, valloader, testloader,
                     optimizer= optimizer,

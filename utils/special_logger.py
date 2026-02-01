@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.amp import autocast
 import io
 import os
+import matplotlib.cm as cm
 
 
 class BaseLogger:
@@ -232,6 +233,56 @@ class CNNLogger:
         
         wandb.log(visuals)
 
-    def call(self, layer, layer_name, activation, epoch):
-        self.log_conv2d_visuals(layer, layer_name, activation, epoch)           
+    def log_eigen_filters(self, layer, layer_name, layer_input, epoch):
+        non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
+
+        if layer_input is None:
+            return
+
+        #Get Weights and Flatten: (Out, In, H, W) -> (K, C*H*W)
+        w = layer.weight.data
+        k, c, h, kw = w.shape
+        w_flat = w.reshape(k, -1)
+
+        if w_flat.shape[1] > 5000:
+            return
+
+        gram = torch.matmul(w_flat.t(), w_flat)
+
+        try:
+            vals, vecs = torch.linalg.eigh(gram)
+        except RuntimeError:
+            return 
+
+        num_vecs = min(10, vecs.shape[1])
+        eigen_filters = vecs[:, -num_vecs:].t().reshape(num_vecs, c, h, kw)
+
+        viz_batch_size = min(len(layer_input), 15)
+        inputs_subset = layer_input[:viz_batch_size]
+
+        # Rotate inputs: 0, 90, 180, 270
+        rotated_inputs = []
+        for rot in range(4):
+            rotated_inputs.append(torch.rot90(inputs_subset, k=rot, dims=[2, 3]))
+        
+        # Interleave: (B, 4, C, H, W) -> (B*4, C, H, W)
+        inputs_subset = torch.stack(rotated_inputs, dim=1).view(-1, inputs_subset.shape[1], inputs_subset.shape[2], inputs_subset.shape[3])
+
+        with torch.no_grad():
+            out = F.conv2d(inputs_subset, eigen_filters, stride=layer.stride, padding=layer.padding)
+        
+        if non_critical:
+            grid = vutils.make_grid(out.reshape(out.shape[0] * num_vecs, 1, *out.shape[2:]), nrow=num_vecs, normalize=True, scale_each=True)
+            wandb.log({f"Eigen_Filters/{layer_name}": wandb.Image(grid, caption=f"Top {num_vecs} Eigen Filter Responses"), "epoch": epoch})
+
+        avg_out = out.mean(dim=1, keepdim=True)
+        grid_avg = vutils.make_grid(avg_out, nrow=4, normalize=True, scale_each=True)
+        
+        heatmap = grid_avg[0].cpu().numpy()
+        heatmap_colored = cm.viridis(heatmap)[:, :, :3]
+        wandb.log({f"Eigen_Filters_Heatmap/{layer_name}": wandb.Image(heatmap_colored, caption="Average Eigen Filter Response"), "epoch": epoch})
+
+    def call(self, layer, layer_name, activation, layer_input, epoch):
+        self.log_conv2d_visuals(layer, layer_name, activation, epoch)
+        self.log_eigen_filters(layer, layer_name, layer_input, epoch)
         

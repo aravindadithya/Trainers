@@ -2,16 +2,11 @@
 import torch
 import wandb
 import time
+import os
 from torch.amp import autocast
 from utils.special_logger import CNNLogger, BaseLogger
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
-
-'''
-Optimization: All the specialized logs like log_cnn_visuals
-can be merged into val_step. This affects readability but improves speed.
-''' 
-
 
 
 def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
@@ -45,6 +40,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     for i in range(start_epoch, start_epoch + num_epochs):
 
         print("EPOCH: ", i)
+        model_saved = False
         #Train loss and accuracy are calculated on the fly during backprob for each epoch
         train_loss, train_acc = train_step(net, optimizer, lfn, train_loader)
         # Validation loss and accuracy are calculated after backprob for each epoch
@@ -63,12 +59,19 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_loss)
             else:
-                scheduler.step()
+                try:
+                    scheduler.step()
+                except ValueError as e:
+                    if "Tried to step" in str(e):
+                        print(f"Scheduler finished: {e}. Stopping training.")
+                        break
+                    raise e
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_val_loss = val_loss
             best_state_dict = net.state_dict()
+            model_saved = True
 
             # Log wandb artifact from memory without saving to a local file      
             artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc, "epoch": i})
@@ -113,6 +116,8 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
                                 log_key="Test Confusion Matrix")
 
     logger.log_predictions_table(net, test_loader, epoch=i, log_key="Test Predictions", limit=256)
+    
+
     logger.finish()
     
     print("FINISHED TRAINING :)")
@@ -141,6 +146,7 @@ def train_step(net, optimizer, lfn, train_loader):
     train_loss_accum = torch.tensor(0.0, device='cuda')
     correct_accum = torch.tensor(0.0, device='cuda')
     total = 0
+    non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
 
     for batch_idx, batch in enumerate(train_loader):
         # Optimization: set_to_none=True skips zeroing the memory, which is faster
@@ -163,7 +169,7 @@ def train_step(net, optimizer, lfn, train_loader):
 
         train_loss_accum += loss.detach() * inputs.size(0)
         # Note: loss.item() triggers a CPU-GPU sync
-        if batch_idx % 10 == 0:
+        if batch_idx % 10 == 0 and non_critical:
             wandb.log({"Batch/loss": loss.item()})
         
         _, predicted = torch.max(output.data, 1)
@@ -236,11 +242,16 @@ def specialized_visuals_dispatcher(net, inputs, epoch):
 
     net.eval()
     activations = {}
+    layer_inputs = {}
     hooks = []
 
     def get_activation(name):
         def hook(model, input, output):
             activations[name] = output.detach()
+            if isinstance(input, tuple):
+                layer_inputs[name] = input[0].detach()
+            else:
+                layer_inputs[name] = input.detach()
         return hook
 
     for name, layer in net.named_modules():
@@ -254,7 +265,8 @@ def specialized_visuals_dispatcher(net, inputs, epoch):
         if type(layer) in layer_handlers:
             handler = layer_handlers[type(layer)]
             activation = activations.get(name)
-            handler.call(layer, name, activation, epoch)
+            inp = layer_inputs.get(name)
+            handler.call(layer, name, activation, inp, epoch)
     
     for h in hooks:
         h.remove()
