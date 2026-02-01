@@ -71,13 +71,6 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
             best_val_acc = val_acc
             best_val_loss = val_loss
             best_state_dict = net.state_dict()
-            model_saved = True
-
-            # Log wandb artifact from memory without saving to a local file      
-            artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc, "epoch": i})
-            with artifact.new_file('best_model.pth', mode='wb') as f:
-                torch.save({'state_dict': best_state_dict}, f)
-            wandb.log_artifact(artifact)
             wandb.run.summary["best_val_accuracy"] = best_val_acc
             wandb.run.summary["best_val_loss"] = best_val_loss
             
@@ -101,10 +94,12 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
 
         wandb.log(log_data)
 
-
-    # Load the model with best val accuracy before final test evaluation. 
-    # Currently the weights are being taken from checkpoint
     if best_state_dict:
+        artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc})
+        with artifact.new_file('best_model.pth', mode='wb') as f:
+            torch.save({'state_dict': best_state_dict}, f)
+        wandb.log_artifact(artifact)
+        
         net.load_state_dict(best_state_dict)
 
     best_test_loss, best_test_acc, test_preds, test_targets = val_step(net, test_loader, lfn)
@@ -122,20 +117,8 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     
     print("FINISHED TRAINING :)")
 
-    '''
 
-    if fn and fn_data:
-        torch.save(fn_data, kwargs['save_path'])
-        '''
 
-def get_data(loader):
-    X = []
-    y = []
-    for idx, batch in enumerate(loader):
-        inputs, labels = batch
-        X.append(inputs)
-        y.append(labels)
-    return torch.cat(X, dim=0), torch.cat(y, dim=0)
 
 
 def train_step(net, optimizer, lfn, train_loader):
@@ -273,25 +256,13 @@ def specialized_visuals_dispatcher(net, inputs, epoch):
 
 
 '''
+def get_data(loader):
+    X = []
+    y = []
+    for idx, batch in enumerate(loader):
+        inputs, labels = batch
+        X.append(inputs)
+        y.append(labels)
+    return torch.cat(X, dim=0), torch.cat(y, dim=0)
 
-def get_acc_ce(net, loader):
-    global scaler
-    net.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)  # Move to CUDA consistently
-            with autocast(device_type='cuda'):
-               outputs = net(inputs)
-            _, predicted = torch.max(outputs.data, 1)  # Get predicted classes
-            total += targets.size(0)
-            # Targets maybe in one-hot format. Hence Max
-            if len(targets.size()) > 1:
-                _, labels = torch.max(targets, -1)
-            else:
-                labels = targets
-            correct += (predicted == labels).sum().item()
-    return 100 * correct / total
-
-    '''
+'''

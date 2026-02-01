@@ -210,32 +210,29 @@ class CNNLogger:
     def __init__(self, image_limits=100, weight_limits=100):
         self.image_limits = image_limits
         self.weight_limits = weight_limits
+        self.non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
 
-    def log_conv2d_visuals(self, layer, layer_name, activation, epoch):
-        """Handler for logging Conv2d weights and activations."""
-        visuals = {'epoch': epoch}
-        # Log weights
+    def log_conv2d_weights(self, layer, layer_name, epoch):
+        """Handler for logging Conv2d weights."""
         w = layer.weight.data
         op, ip, q, s = w.shape
         w = w.reshape(op * ip, 1, q, s)
         if w.shape[0] > self.weight_limits:
             w = w[:self.weight_limits]
-        grid_w = vutils.make_grid(w, nrow=ip  , normalize=True, scale_each=False)
-        visuals[f"Weights_Images/{layer_name}"] = wandb.Image(grid_w, caption=f"Weights_Images {layer_name}")
+        grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
+        wandb.log({f"Weights_Images/{layer_name}": wandb.Image(grid_w, caption=f"Weights_Images {layer_name}"), "epoch": epoch})
 
-        # Log activations
+    def log_conv2d_activations(self, layer_name, activation, epoch):
+        """Handler for logging Conv2d activations."""
         if activation is not None:
             act = activation
             n, ip_act, q_act, s_act = act.shape
             act = act.reshape(n * ip_act, 1, q_act, s_act)
             grid_a = vutils.make_grid(act, nrow=ip_act, normalize=True, scale_each=False)
-            visuals[f"Activation_Images/{layer_name}"] = wandb.Image(grid_a, caption=f"Activations_Images {layer_name}")
-        
-        wandb.log(visuals)
+            wandb.log({f"Activation_Images/{layer_name}": wandb.Image(grid_a, caption=f"Activations_Images {layer_name}"), "epoch": epoch})
 
     def log_eigen_filters(self, layer, layer_name, layer_input, epoch):
-        non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
-
+        
         if layer_input is None:
             return
 
@@ -271,7 +268,7 @@ class CNNLogger:
         with torch.no_grad():
             out = F.conv2d(inputs_subset, eigen_filters, stride=layer.stride, padding=layer.padding)
         
-        if non_critical:
+        if self.non_critical:
             grid = vutils.make_grid(out.reshape(out.shape[0] * num_vecs, 1, *out.shape[2:]), nrow=num_vecs, normalize=True, scale_each=True)
             wandb.log({f"Eigen_Filters/{layer_name}": wandb.Image(grid, caption=f"Top {num_vecs} Eigen Filter Responses"), "epoch": epoch})
 
@@ -283,6 +280,9 @@ class CNNLogger:
         wandb.log({f"Eigen_Filters_Heatmap/{layer_name}": wandb.Image(heatmap_colored, caption="Average Eigen Filter Response"), "epoch": epoch})
 
     def call(self, layer, layer_name, activation, layer_input, epoch):
-        self.log_conv2d_visuals(layer, layer_name, activation, epoch)
+        if self.non_critical:
+            self.log_conv2d_weights(layer, layer_name, epoch)
+
+        self.log_conv2d_activations(layer_name, activation, epoch)
         self.log_eigen_filters(layer, layer_name, layer_input, epoch)
         

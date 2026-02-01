@@ -27,7 +27,7 @@ def get_loaders():
     
     means = (0.4914, 0.4822, 0.4465)
     transform_train = transforms.Compose([
-        #transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(32, padding=4),
         #transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(means, (0.2023, 0.1994, 0.2010)),
@@ -97,11 +97,9 @@ def get_trained_net(run_id="1"):
 
 def cleanup_artifacts(run_id):
     api = wandb.Api()
-    # Entity is hardcoded in special_logger.py
     entity = "Trainers100"
     project = names['project']
 
-    # Cleanup models: Keep latest
     try:
         versions = api.artifact_versions("model", f"{entity}/{project}/model-{run_id}")
         for v in versions:
@@ -126,9 +124,9 @@ def train_net(run_id="1", epochs=10):
     names['run_id']= run_id
     names['name']= f"{model_name}"
 
-    optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
     #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
     
 
     t.train_network(trainloader, valloader, testloader,
