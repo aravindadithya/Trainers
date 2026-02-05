@@ -9,11 +9,18 @@ scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
 
-def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
-                  scheduler=None, names=None, num_epochs = 5):
+def train_network(config, num_epochs = 5):
 
    
     torch.set_float32_matmul_precision('high')
+
+    net = config['net']
+    optimizer = config['optimizer']
+    lfn = config['lfn']
+    scheduler = config.get('scheduler')
+    train_loader = config['train_loader']
+    val_loader = config['val_loader']
+    test_loader = config['test_loader']
 
     net.cuda()
 
@@ -22,7 +29,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     #net = torch.compile(net)
 
     print("Initializing Wandb:")
-    logger = BaseLogger(names, optimizer, lfn, net, scheduler, val_loader)
+    logger = BaseLogger(config)
 
     
     wandb.watch(net, log="all", log_freq=100, idx=0)
@@ -82,7 +89,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
                 specialized_visuals_dispatcher(net, inputs, targets, epoch=i)
 
         if i % 10 == 0:
-            artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
+            artifact = wandb.Artifact(f"checkpoint-{config['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
             with artifact.new_file('last_model.pth', mode='wb') as f:
                 torch.save({
                     'state_dict': net.state_dict(),
@@ -94,7 +101,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
         wandb.log(log_data)
 
     if best_state_dict:
-        artifact = wandb.Artifact(f"model-{names['run_id']}", type='model', metadata={"best_val_acc": best_val_acc})
+        artifact = wandb.Artifact(f"model-{config['run_id']}", type='model', metadata={"best_val_acc": best_val_acc})
         with artifact.new_file('best_model.pth', mode='wb') as f:
             torch.save({'state_dict': best_state_dict}, f)
         wandb.log_artifact(artifact)
@@ -218,28 +225,26 @@ def specialized_visuals_dispatcher(net, inputs, targets, epoch):
     """
     layer_handlers = {}
     
-    layer_handlers[torch.nn.Conv2d] = CNNLogger(inputs, targets, secondary_dim=4, max_images=100, max_weight_filters=20)
+    layer_handlers[torch.nn.Conv2d] = CNNLogger(inputs, targets, secondary_dim=4, max_weight_filters=20)
 
     if not layer_handlers:
         return
 
     net.eval()
-    activations = {}
-    layer_inputs = {}
     hooks = []
 
-    def get_activation(name):
+    def get_activation(name, layer, handler):
         def hook(model, input, output):
-            activations[name] = output.detach()
+            inp = input
             if isinstance(input, tuple):
-                layer_inputs[name] = input[0].detach()
-            else:
-                layer_inputs[name] = input.detach()
+                inp = input[0]
+            handler.update_layer_info(name, layer, inp.detach(), output.detach())
         return hook
 
     for name, layer in net.named_modules():
         if type(layer) in layer_handlers:
-            hooks.append(layer.register_forward_hook(get_activation(name)))
+            handler = layer_handlers[type(layer)]
+            hooks.append(layer.register_forward_hook(get_activation(name, layer, handler)))
 
     with torch.no_grad():
         outputs = net(inputs)
@@ -248,12 +253,61 @@ def specialized_visuals_dispatcher(net, inputs, targets, epoch):
     for h in hooks:
         h.remove()
 
-    for name, layer in net.named_modules():
-        if type(layer) in layer_handlers:
-            handler = layer_handlers[type(layer)]
-            activation = activations.get(name)
-            inp = layer_inputs.get(name)
-            handler.call(layer, name, activation, inp, epoch, net=net, pred_targets=pred_targets)
+    for handler in layer_handlers.values():
+        handler.log_all(epoch, net=net, pred_targets=pred_targets)
+
+
+def get_acc_ce(net, loader):
+    global scaler
+    net.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            with autocast(device_type='cuda'):
+               outputs = net(inputs)
+            _, predicted = torch.max(outputs.data, 1)  # Get predicted classes
+            total += targets.size(0)
+            # Targets maybe in one-hot format. Hence Max
+            if len(targets.size()) > 1:
+                _, labels = torch.max(targets, -1)
+            else:
+                labels = targets
+            correct += (predicted == labels).sum().item()
+    return 100 * correct / total
+
+
+def get_trained_net(config):
+    net = config['net']
+    api = wandb.Api()
+    try:
+        artifact = api.artifact(f"{config['entity']}/{config['project']}/model-{config['run_id']}:latest")
+        model_dir = artifact.download()
+        checkpoint = torch.load(os.path.join(model_dir, 'best_model.pth'), weights_only=True)
+        net.load_state_dict(checkpoint['state_dict'])
+        print(f"Loaded weights from artifact: {artifact.name}")
+        
+    except Exception as e:
+        print(f"Error loading from WandB: {e}")
+    return net
+
+def cleanup_artifacts(config):
+    api = wandb.Api()
+    try:
+        versions = api.artifact_versions("model", f"{config['entity']}/{config['project']}/model-{config['run_id']}")
+        for v in versions:
+            if 'latest' not in v.aliases:
+                v.delete()
+        versions = api.artifact_versions("model", f"{config['entity']}/{config['project']}/checkpoint-{config['run_id']}")
+        for v in versions:
+            v.delete()
+
+    except Exception:
+        print("Error cleaning up artifacts")
+        pass
+
 
 
 '''

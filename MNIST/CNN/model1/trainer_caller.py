@@ -72,12 +72,23 @@ def train_net(run_id="1", epochs=10):
 
     optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
     scheduler = CosineAnnealingWarmRestartsDecay(optimizer, T_0=int(epochs/3)+1, decay=0.8)
+    lfn = nn.CrossEntropyLoss()
 
-    t.train_network(trainloader, valloader, testloader,
-                    optimizer=optimizer,
-                    lfn=  nn.CrossEntropyLoss(), 
-                    num_epochs=epochs,
-                    names=names, net=net, scheduler=scheduler)
+    config = {
+        "project": names['project'],
+        "entity": "Trainers100",
+        "run_name": names['name'],
+        "run_id": run_id,
+        "net": net,
+        "train_loader": trainloader,
+        "val_loader": valloader,
+        "test_loader": testloader,
+        "optimizer": optimizer,
+        "lfn": lfn,
+        "scheduler": scheduler
+    }
+
+    t.train_network(config, num_epochs=epochs)
     
 
 def main():
