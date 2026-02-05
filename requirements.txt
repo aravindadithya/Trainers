@@ -5,3 +5,5 @@ torchmetrics
 wandb
 onnx
 onnxscript
+matplotlib
+captum

@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader
 import model1
 import torch.nn as nn
 from utils import trainer as t
-from copy import deepcopy
+import wandb
+from utils.special_schedulers import CosineAnnealingWarmRestartsDecay
 
 workspaces_path= os.getenv('PYTHONPATH')
 workspaces_path = "/workspaces/Trainers/"
@@ -42,9 +43,9 @@ def get_loaders(batch_size=1024):
     
     # 3. Create Loaders
     # num_workers=0 is often faster for small datasets like MNIST on Windows/Laptops
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=16, pin_memory=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True, persistent_workers=True)
 
     return train_loader, val_loader, test_loader
     
@@ -55,38 +56,49 @@ def get_untrained_net():
     net = model1.Net(28*28, num_classes=10)
     return net
 
-def train_net(force_train=False, run_id="1", fn=None, kwargs={}): 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+def get_trained_net(run_id="1"):
     net = get_untrained_net()
-    init_net = deepcopy(net)
-    trainloader, valloader, testloader = get_loaders()
-    model_dir = os.path.join(workspaces_path,'MNIST', 'FC','model1', 'nn_models/')
-    path_exists = os.path.exists(model_dir + 'best_model.pth')
-    
-    names['run_id']= run_id
-    names['name']= f"{model_name}"
+    api = wandb.Api()
+    try:
+        artifact = api.artifact(f"Trainers100/{names['project']}/model-{run_id}:latest")
+        model_dir = artifact.download()
+        checkpoint = torch.load(os.path.join(model_dir, 'best_model.pth'), weights_only=True)
+        net.load_state_dict(checkpoint['state_dict'])
+        print(f"Loaded weights from artifact: {artifact.name}")
+        
+    except Exception as e:
+        print(f"Error loading from WandB: {e}")
+    return net
 
-    if path_exists:
-        checkpoint = torch.load(model_dir + 'best_model.pth', weights_only=True)
-        net.load_state_dict(checkpoint['state_dict'])  # Access the 'state_dict' within the loaded dictionary
-        checkpoint = torch.load(model_dir + 'trained_nn_0.pth', weights_only=True)
-        init_net.load_state_dict(checkpoint['state_dict'])
-        print("Model weights loaded successfully.")  
-        
-    if not path_exists or force_train:   
-        t.train_network(trainloader, valloader, testloader,
-                        root_path= model_dir, 
-                        optimizer=torch.optim.SGD(net.parameters(), lr=.1),
-                        lfn=  nn.CrossEntropyLoss(), 
-                        num_epochs = 10,
-                        names=names, net=net, init_net= init_net, save_init= not force_train, fn=fn, kwargs=kwargs)  
-       
-        
-    return trainloader, valloader, testloader, init_net, net
+def train_net(run_id="1", epochs=10):
+    net = get_untrained_net()
+    trainloader, valloader, testloader = get_loaders()
+    names['run_id'] = run_id
+    names['name'] = f"{model_name}"
+
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+    scheduler = CosineAnnealingWarmRestartsDecay(optimizer, T_0=int(epochs/3)+1, decay=0.8)
+    lfn = nn.CrossEntropyLoss()
+
+    config = {
+        "project": names['project'],
+        "entity": "Trainers100",
+        "run_name": names['name'],
+        "run_id": run_id,
+        "net": net,
+        "train_loader": trainloader,
+        "val_loader": valloader,
+        "test_loader": testloader,
+        "optimizer": optimizer,
+        "lfn": lfn,
+        "scheduler": scheduler
+    }
+
+    t.train_network(config, num_epochs=epochs)
     
 
 def main():
-    train_net(force_train=True)
+    train_net()
 
 if __name__ == "__main__":
     #For some reason executing through console adds 4sec delay
