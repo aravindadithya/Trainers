@@ -9,11 +9,16 @@ import wandb
 import model
 
 
+
+
+
 workspaces_path= os.getenv('PYTHONPATH')
 print(f"Current Path: {workspaces_path}")
 
-model_name = os.getcwd()
-names = {'project':'CIFAR10'}
+
+api = wandb.Api()
+names = {'project':'CIFAR10', 'name': 'Resnet18_CNN', 'entity': 'Trainers100'}
+
 
 
 # ACCESS LOADERS
@@ -28,7 +33,7 @@ def get_loaders():
     means = (0.4914, 0.4822, 0.4465)
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
-        #transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(means, (0.2023, 0.1994, 0.2010)),
     ])
@@ -83,9 +88,8 @@ def get_untrained_net():
 
 def get_trained_net(run_id="1"):
     net = get_untrained_net()
-    api = wandb.Api()
     try:
-        artifact = api.artifact(f"Trainers100/{names['project']}/model-{run_id}:latest")
+        artifact = api.artifact(f"{names['entity']}/{names['project']}/model-{run_id}:latest")
         model_dir = artifact.download()
         checkpoint = torch.load(os.path.join(model_dir, 'best_model.pth'), weights_only=True)
         net.load_state_dict(checkpoint['state_dict'])
@@ -96,25 +100,20 @@ def get_trained_net(run_id="1"):
     return net
 
 def cleanup_artifacts(run_id):
-    api = wandb.Api()
-    entity = "Trainers100"
-    project = names['project']
 
     try:
-        versions = api.artifact_versions("model", f"{entity}/{project}/model-{run_id}")
+        versions = api.artifact_versions("model", f"{names['entity']}/{names['project']}/model-{run_id}")
         for v in versions:
             if 'latest' not in v.aliases:
                 v.delete()
-    except Exception:
-        pass
-
-    # Cleanup checkpoints: Delete all
-    try:
-        versions = api.artifact_versions("model", f"{entity}/{project}/checkpoint-{run_id}")
+        versions = api.artifact_versions("model", f"{names['entity']}/{names['project']}/checkpoint-{run_id}")
         for v in versions:
             v.delete()
+
     except Exception:
+        print("Error cleaning up artifacts")
         pass
+
 
 def train_net(run_id="1", epochs=10):
 
@@ -122,7 +121,6 @@ def train_net(run_id="1", epochs=10):
      
     trainloader, valloader, testloader = get_loaders() 
     names['run_id']= run_id
-    names['name']= f"{model_name}"
 
     optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
     #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)

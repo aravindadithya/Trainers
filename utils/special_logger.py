@@ -6,11 +6,12 @@ from torch.amp import autocast
 import io
 import os
 import matplotlib.cm as cm
+from captum.attr import LayerGradCam, LayerAttribution
 
 
 class BaseLogger:
 
-    def __init__(self, names, optimizer, lfn, net, scheduler=None, val_loader=None):
+    def __init__(self, names, optimizer, lfn, net, scheduler=None, val_loader=None, rotate_inputs=True):
         
         self.names = names
         self.optimizer = optimizer
@@ -24,8 +25,8 @@ class BaseLogger:
         self.best_val_acc = 0
         self.best_val_loss = float("inf")
         self.best_state_dict = None
-        
-        self.inputs = self._get_viz_inputs(val_loader)
+        self.rotate_inputs = rotate_inputs
+        self.inputs, self.targets = self._get_viz_inputs(val_loader)
 
         if wandb.run.resumed:
             self._resume_run()
@@ -33,7 +34,9 @@ class BaseLogger:
             self._log_initial_artifacts(self.inputs)
 
     def _initialize_wandb(self, names, optimizer, lfn, net, scheduler=None):
+        
         project = names['project']
+        entity = names['entity']
         run_name = names['name']
         id = names['run_id']
 
@@ -54,7 +57,7 @@ class BaseLogger:
 
         wandb.login(key=os.getenv('WANDB_API_KEY'))
 
-        wandb.init(project=project, name=run_name, resume="allow", id=id, config=config, entity="Trainers100")
+        wandb.init(project=project, name=run_name, resume="allow", id=id, config=config, entity=entity)
 
         # Define 'epoch' as the step metric for all epoch-level logs
         wandb.define_metric("epoch")
@@ -74,18 +77,31 @@ class BaseLogger:
 
     def _get_viz_inputs(self, val_loader):
         inputs = None
+        targets = None
         if val_loader is None:
-            return None
+            return None, None
         try:
             val_iter = iter(val_loader)
-            inputs, _ = next(val_iter)
+            inputs, targets = next(val_iter)
             inputs = inputs[:20]
+            targets = targets[:20]
             inputs = inputs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            
+            if inputs.dim() == 4 and self.rotate_inputs:
+                # Rotate inputs: 0, 90, 180, 270
+                rotated_inputs = []
+                for rot in range(4):
+                    rotated_inputs.append(torch.rot90(inputs, k=rot, dims=[2, 3]))       
+                # Stack: (B, 4, C, H, W)
+                inputs = torch.stack(rotated_inputs, dim=1)
+                inputs = inputs.reshape(-1, inputs.shape[2], inputs.shape[3], inputs.shape[4])
+                targets = torch.repeat_interleave(targets, 4, dim=0)
         except StopIteration:
             print("Viz setup failed: val_loader appears to be empty. Cannot fetch a batch for visualization.")
         except Exception as e:
             print(f"Viz setup failed with an unexpected error: {e}")
-        return inputs
+        return inputs, targets
 
     def _resume_run(self):
         print("Resuming from previous run...")
@@ -119,7 +135,14 @@ class BaseLogger:
 
     def _log_initial_artifacts(self, inputs):
         if inputs is not None:
-            wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(inputs[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(inputs))], "epoch": 0})
+            if inputs.dim() == 5:
+                imgs = []
+                for i in range(len(inputs)):
+                    grid = vutils.make_grid(inputs[i], nrow=inputs.shape[1], normalize=True)
+                    imgs.append(wandb.Image(grid, caption=f"Img {i}"))
+                wandb.log({"fixed_val_images": imgs, "epoch": 0})
+            else:
+                wandb.log({"fixed_val_images": [wandb.Image(vutils.make_grid(inputs[i].unsqueeze(0), normalize=True), caption=f"Img {i}") for i in range(len(inputs))], "epoch": 0})
 
         # Log initial weights for new runs
         artifact = wandb.Artifact(f"init-weights-{self.names['run_id']}", type='model', metadata={"epoch": 0})
@@ -130,6 +153,10 @@ class BaseLogger:
         if inputs is not None:
             self.net.eval()
             dummy_input = inputs[0].unsqueeze(0).cuda() 
+            if inputs.dim() == 5:
+                dummy_input = inputs[0][0].unsqueeze(0).cuda()
+            else:
+                dummy_input = inputs[0].unsqueeze(0).cuda() 
             artifact = wandb.Artifact(f"onnx-{self.names['run_id']}", type='model')
             onnx_buffer = io.BytesIO()
             torch.onnx.export(self.net, dummy_input, onnx_buffer, input_names=['input'], output_names=['output'])
@@ -207,35 +234,42 @@ class BaseLogger:
 
 class CNNLogger:
 
-    def __init__(self, image_limits=100, weight_limits=100):
-        self.image_limits = image_limits
-        self.weight_limits = weight_limits
+    def __init__(self, inputs, targets, secondary_dim=1 , max_images=100, max_weight_filters=100):
+        self.max_images = max_images
+        self.max_weight_filters = max_weight_filters
         self.non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
+        
+        self.viz_inputs = None
+        self.viz_targets = None
+        self.secondary_dim = secondary_dim
+        if inputs is not None:
+            viz_batch_size = min(len(inputs), self.max_images)
+            self.viz_inputs = inputs[:viz_batch_size]
+            if targets is not None:
+                self.viz_targets = targets[:viz_batch_size]
 
-    def log_conv2d_weights(self, layer, layer_name, epoch):
+    def log_weights(self, layer, layer_name, epoch):
         """Handler for logging Conv2d weights."""
         w = layer.weight.data
         op, ip, q, s = w.shape
         w = w.reshape(op * ip, 1, q, s)
-        if w.shape[0] > self.weight_limits:
-            w = w[:self.weight_limits]
+        if w.shape[0] > self.max_weight_filters:
+            w = w[:self.max_weight_filters]
         grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
-        wandb.log({f"Weights_Images/{layer_name}": wandb.Image(grid_w, caption=f"Weights_Images {layer_name}"), "epoch": epoch})
+        wandb.log({f"Weight_Filters/{layer_name}": wandb.Image(grid_w, caption=f"Weights_Filter of {layer_name}"), "epoch": epoch})
 
-    def log_conv2d_activations(self, layer_name, activation, epoch):
+    def log_featuremap(self, layer_name, activation, epoch):
         """Handler for logging Conv2d activations."""
         if activation is not None:
-            act = activation
-            n, ip_act, q_act, s_act = act.shape
-            act = act.reshape(n * ip_act, 1, q_act, s_act)
-            grid_a = vutils.make_grid(act, nrow=ip_act, normalize=True, scale_each=False)
-            wandb.log({f"Activation_Images/{layer_name}": wandb.Image(grid_a, caption=f"Activations_Images {layer_name}"), "epoch": epoch})
+            avg_act = activation.mean(dim=1, keepdim=True)
+            grid = vutils.make_grid(avg_act, nrow=self.secondary_dim, normalize=True, scale_each=True)
+            
+            heatmap = grid[0].cpu().numpy()
+            heatmap_colored = cm.viridis(heatmap)[:, :, :3]
+            wandb.log({f"Output/{layer_name}": wandb.Image(heatmap_colored, caption=f"Mean Output of {layer_name}"), "epoch": epoch})
 
-    def log_eigen_filters(self, layer, layer_name, layer_input, epoch):
+    def log_eigen_featuremap(self, layer, layer_name, inputs, epoch):
         
-        if layer_input is None:
-            return
-
         #Get Weights and Flatten: (Out, In, H, W) -> (K, C*H*W)
         w = layer.weight.data
         k, c, h, kw = w.shape
@@ -244,6 +278,7 @@ class CNNLogger:
         if w_flat.shape[1] > 5000:
             return
 
+        # Compute Gram Matrix and Eigen Decomposition
         gram = torch.matmul(w_flat.t(), w_flat)
 
         try:
@@ -254,35 +289,71 @@ class CNNLogger:
         num_vecs = min(10, vecs.shape[1])
         eigen_filters = vecs[:, -num_vecs:].t().reshape(num_vecs, c, h, kw)
 
-        viz_batch_size = min(len(layer_input), 15)
-        inputs_subset = layer_input[:viz_batch_size]
-
-        # Rotate inputs: 0, 90, 180, 270
-        rotated_inputs = []
-        for rot in range(4):
-            rotated_inputs.append(torch.rot90(inputs_subset, k=rot, dims=[2, 3]))
-        
-        # Interleave: (B, 4, C, H, W) -> (B*4, C, H, W)
-        inputs_subset = torch.stack(rotated_inputs, dim=1).view(-1, inputs_subset.shape[1], inputs_subset.shape[2], inputs_subset.shape[3])
-
         with torch.no_grad():
-            out = F.conv2d(inputs_subset, eigen_filters, stride=layer.stride, padding=layer.padding)
-        
+            out = F.conv2d(inputs, eigen_filters, stride=layer.stride, padding=layer.padding)
+        '''
         if self.non_critical:
             grid = vutils.make_grid(out.reshape(out.shape[0] * num_vecs, 1, *out.shape[2:]), nrow=num_vecs, normalize=True, scale_each=True)
             wandb.log({f"Eigen_Filters/{layer_name}": wandb.Image(grid, caption=f"Top {num_vecs} Eigen Filter Responses"), "epoch": epoch})
-
+        '''
         avg_out = out.mean(dim=1, keepdim=True)
-        grid_avg = vutils.make_grid(avg_out, nrow=4, normalize=True, scale_each=True)
+        grid_avg = vutils.make_grid(avg_out, nrow=self.secondary_dim, normalize=True, scale_each=True)
         
         heatmap = grid_avg[0].cpu().numpy()
         heatmap_colored = cm.viridis(heatmap)[:, :, :3]
-        wandb.log({f"Eigen_Filters_Heatmap/{layer_name}": wandb.Image(heatmap_colored, caption="Average Eigen Filter Response"), "epoch": epoch})
+        wandb.log({f"Eigen_Featuremap_Mean/{layer_name}": wandb.Image(heatmap_colored, caption="Average Eigen Filter Response"), "epoch": epoch})
 
-    def call(self, layer, layer_name, activation, layer_input, epoch):
+    def log_grad_cam(self, net, layer, layer_name, epoch, pred_targets=None):
+        if self.viz_inputs is None or net is None or pred_targets is None:
+            return
+
+        inputs = self.viz_inputs
+        targets = self.viz_targets
+        
+        # Enable gradients for Captum
+        prev_grad_state = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        
+        try:
+            layer_gc = LayerGradCam(net, layer)
+            
+            # 1. GradCAM wrt Predictions
+            attr_pred = layer_gc.attribute(inputs, target=pred_targets, relu_attributions=True)
+            attr_pred = LayerAttribution.interpolate(attr_pred, inputs.shape[2:], interpolate_mode='bilinear')
+            
+            # 2. GradCAM wrt Actual Targets
+            attr_true = None
+            if targets is not None:
+                attr_true = layer_gc.attribute(inputs, target=targets, relu_attributions=True)
+                attr_true = LayerAttribution.interpolate(attr_true, inputs.shape[2:], interpolate_mode='bilinear')
+
+            def log_viz(attr, suffix, title):
+                grid_img = vutils.make_grid(inputs, nrow=self.secondary_dim, normalize=True)
+                grid_attr = vutils.make_grid(attr, nrow=self.secondary_dim, normalize=True, scale_each=True)
+                
+                img_np = grid_img.permute(1, 2, 0).cpu().numpy()
+                attr_np = grid_attr.permute(1, 2, 0).cpu().numpy()
+                
+                heatmap_colored = cm.viridis(attr_np[:, :, 0])[:, :, :3]
+                blended = 0.5 * img_np + 0.5 * heatmap_colored
+                wandb.log({f"GradCAM_{suffix}/{layer_name}": wandb.Image(blended, caption=f"GradCAM {title} {layer_name}"), "epoch": epoch})
+
+            log_viz(attr_pred, "Pred", "(Pred)")
+            if attr_true is not None:
+                log_viz(attr_true, "True", "(True)")
+        finally:
+            torch.set_grad_enabled(prev_grad_state)
+
+    def call(self, layer, layer_name, activation, layer_input, epoch, net=None, pred_targets=None):
+
+        viz_batch_size = min(len(layer_input), self.max_images)
+        inputs_subset = layer_input[:viz_batch_size]
+
+        self.log_featuremap(layer_name, activation, epoch)
+        self.log_grad_cam(net, layer, layer_name, epoch, pred_targets=pred_targets)
+
         if self.non_critical:
-            self.log_conv2d_weights(layer, layer_name, epoch)
-
-        self.log_conv2d_activations(layer_name, activation, epoch)
-        self.log_eigen_filters(layer, layer_name, layer_input, epoch)
+            self.log_weights(layer, layer_name, epoch)
+            self.log_eigen_featuremap(layer, layer_name, inputs_subset, epoch)
+        
         

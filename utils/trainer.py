@@ -16,8 +16,6 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     torch.set_float32_matmul_precision('high')
 
     net.cuda()
-    # Optimization: Use Channels Last memory format for faster CNNs on Tensor Cores
-    net = net.to(memory_format=torch.channels_last)
 
     # This is supposed to improve performance but I found mixed results 
     # with diminishing returns
@@ -36,6 +34,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
     best_val_loss = logger.best_val_loss
     best_state_dict = logger.best_state_dict
     inputs = logger.inputs
+    targets = logger.targets
 
     for i in range(start_epoch, start_epoch + num_epochs):
 
@@ -80,7 +79,7 @@ def train_network(train_loader, val_loader, test_loader, net, optimizer, lfn,
 
             logger.log_predictions_table(net, val_loader, epoch=i, log_key="Validation Predictions", limit=256)
             if inputs is not None:
-                specialized_visuals_dispatcher(net, inputs, epoch=i)
+                specialized_visuals_dispatcher(net, inputs, targets, epoch=i)
 
         if i % 10 == 0:
             artifact = wandb.Artifact(f"checkpoint-{names['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
@@ -212,13 +211,14 @@ def val_step(net, val_loader, lfn):
 
 
 
-def specialized_visuals_dispatcher(net, inputs, epoch):
+def specialized_visuals_dispatcher(net, inputs, targets, epoch):
     """
     Dispatches to specialized visual loggers based on model type.
     This function uses a generic hook-based mechanism to capture and log layer details.
     """
     layer_handlers = {}
-    layer_handlers[torch.nn.Conv2d] = CNNLogger(100, 100)
+    
+    layer_handlers[torch.nn.Conv2d] = CNNLogger(inputs, targets, secondary_dim=4, max_images=100, max_weight_filters=20)
 
     if not layer_handlers:
         return
@@ -242,17 +242,18 @@ def specialized_visuals_dispatcher(net, inputs, epoch):
             hooks.append(layer.register_forward_hook(get_activation(name)))
 
     with torch.no_grad():
-        net(inputs)
+        outputs = net(inputs)
+        pred_targets = torch.argmax(outputs, dim=1)
+
+    for h in hooks:
+        h.remove()
 
     for name, layer in net.named_modules():
         if type(layer) in layer_handlers:
             handler = layer_handlers[type(layer)]
             activation = activations.get(name)
             inp = layer_inputs.get(name)
-            handler.call(layer, name, activation, inp, epoch)
-    
-    for h in hooks:
-        h.remove()
+            handler.call(layer, name, activation, inp, epoch, net=net, pred_targets=pred_targets)
 
 
 '''
