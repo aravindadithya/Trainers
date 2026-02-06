@@ -9,7 +9,7 @@ scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
 
-def train_network(config, num_epochs = 5):
+def train_network(config, num_epochs = 5, checkpoint_interval=10):
 
    
     torch.set_float32_matmul_precision('high')
@@ -88,7 +88,7 @@ def train_network(config, num_epochs = 5):
             if inputs is not None:
                 specialized_visuals_dispatcher(net, inputs, targets, epoch=i)
 
-        if i % 10 == 0:
+        if i % checkpoint_interval == 0:
             artifact = wandb.Artifact(f"checkpoint-{config['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
             with artifact.new_file('last_model.pth', mode='wb') as f:
                 torch.save({
