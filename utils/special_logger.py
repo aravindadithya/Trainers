@@ -7,6 +7,7 @@ import io
 import os
 import matplotlib.cm as cm
 from captum.attr import LayerGradCam, LayerAttribution, IntegratedGradients
+import numpy as np
 
 
 class BaseLogger:
@@ -98,6 +99,11 @@ class BaseLogger:
             inputs = torch.stack(collected_inputs)
             targets = torch.stack(collected_targets)
 
+            # Sort inputs and targets by class label
+            indices = torch.argsort(targets)
+            inputs = inputs[indices]
+            targets = targets[indices]
+
             inputs = inputs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
 
@@ -173,14 +179,20 @@ class BaseLogger:
             "epoch": epoch
         })
 
-    def log_predictions_table(self, net, epoch, log_key, outputs_precomputed=None):
+    def log_predictions_table(self, net, log_key, outputs_precomputed=None, extra_visuals=None):
         net.eval()
         inputs, targets = self.inputs, self.targets
         if inputs is None:
-            return
+            return {}
 
         num_classes = self.config.get('num_classes', 10)
         columns = ["Image", "Ground Truth", "Prediction", "Confidence"] + [f"Score_{i}" for i in range(num_classes)]
+        
+        extra_keys = []
+        if extra_visuals:
+            extra_keys = list(extra_visuals.keys())
+            columns.extend(extra_keys)
+
         table = wandb.Table(columns=columns)
         
         with torch.no_grad():
@@ -206,8 +218,7 @@ class BaseLogger:
             confidences_cpu = confidences.cpu()
             probs_cpu = probs.cpu()
 
-            # Limit to 64 images to prevent hanging on large visualization batches
-            for j in range(min(len(inputs_cpu), 64)):
+            for j in range(len(inputs_cpu)):
                 img = inputs_cpu[j]
                 #TODO: Handle the case when image is given as 1D tensor properly.
                 if img.dim() == 1:
@@ -216,10 +227,20 @@ class BaseLogger:
                 img_viz = vutils.make_grid(img, normalize=True)
                 row = [wandb.Image(img_viz), str(targets_cpu[j].item()), str(preds_cpu[j].item()), confidences_cpu[j].item()]
                 row.extend(probs_cpu[j].tolist())
+                
+                if extra_visuals:
+                    for key in extra_keys:
+                        if j < len(extra_visuals[key]):
+                            row.append(extra_visuals[key][j])
+                        else:
+                            row.append(None)
+
                 table.add_data(*row)
 
         if table.data:
-            wandb.log({log_key: table, "epoch": epoch})
+            return {log_key: table}
+        
+        return {}
 
     def log_visuals(self, net, epoch):
         """
@@ -239,7 +260,7 @@ class BaseLogger:
 
         # If no specialized handlers, just log the prediction table and return.
         if not layer_handlers:
-            self.log_predictions_table(net, epoch, "Validation Predictions")
+            wandb.log({**self.log_predictions_table(net, "Validation Predictions"), "epoch": epoch})
             return
 
         hooks = []
@@ -263,15 +284,24 @@ class BaseLogger:
         for h in hooks:
             h.remove()
 
-        # Use the pre-computed outputs to log the prediction table
-        print("Logging Prediction Table...")
-        self.log_predictions_table(net, epoch, "Validation Predictions", outputs_precomputed=outputs)
-
-        # Continue with specialized logging using the populated handlers
+        all_logs = {}
+        
         print("Generating Layer Visuals (GradCAM, IG, FeatureMaps)...")
         pred_targets = torch.argmax(outputs, dim=1)
+        per_sample_visuals = {}
+
         for handler in layer_handlers.values():
-            handler.log_all(epoch, net=net, pred_targets=pred_targets)
+            global_logs, sample_logs = handler.get_visuals(net=net, pred_targets=pred_targets)
+            all_logs.update(global_logs)
+            per_sample_visuals.update(sample_logs)
+
+        # Use the pre-computed outputs to log the prediction table with extra visuals
+        print("Logging Prediction Table...")
+        all_logs.update(self.log_predictions_table(net, "Validation Predictions", outputs_precomputed=outputs, extra_visuals=per_sample_visuals))
+
+        if all_logs:
+            all_logs["epoch"] = epoch
+            wandb.log(all_logs)
         print("Visuals Logging Completed.")
 
     def finish(self):
@@ -281,6 +311,7 @@ class BaseLogger:
 class CNNLogger:
 
     def __init__(self, inputs, targets, secondary_dim=1 , max_weight_filters=100, config=None):
+        
         self.max_weight_filters = max_weight_filters
         self.non_critical = os.getenv('NON_CRITICAL_LOGS', 'False').lower() in ('true', '1', 't')
         self.secondary_dim = secondary_dim
@@ -289,27 +320,58 @@ class CNNLogger:
         self.layer_info = {}
         self.config = config
 
-    def log_weights(self, layer, layer_name, epoch):
-        """Handler for logging Conv2d weights."""
+    def _create_blended_images(self, inputs, attrs):
+        imgs = []
+        inputs = inputs.detach().cpu()
+        attrs = attrs.detach().cpu()
+        
+        for i in range(len(inputs)):
+            img = inputs[i]
+            attr = attrs[i]
+            
+            img = (img - img.min()) / (img.max() - img.min() + 1e-7)
+            img_np = img.permute(1, 2, 0).numpy()
+            if img_np.shape[2] == 1:
+                img_np = np.repeat(img_np, 3, axis=2)
+            
+            attr = (attr - attr.min()) / (attr.max() - attr.min() + 1e-7)
+            attr_np = attr.squeeze().numpy()
+            
+            heatmap = cm.viridis(attr_np)[:, :, :3]
+            blended = img_np * heatmap
+            imgs.append(wandb.Image(blended))
+        return imgs
+
+    def _create_heatmap_images(self, attrs):
+        imgs = []
+        attrs = attrs.detach().cpu()
+        for i in range(len(attrs)):
+            attr = attrs[i]
+            attr = (attr - attr.min()) / (attr.max() - attr.min() + 1e-7)
+            attr_np = attr.squeeze().numpy()
+            heatmap = cm.viridis(attr_np)[:, :, :3]
+            imgs.append(wandb.Image(heatmap))
+        return imgs
+
+    def log_weights(self, layer, layer_name):
+        """Computes Conv2d weight visualization."""
         w = layer.weight.data
         op, ip, q, s = w.shape
         w = w.reshape(op * ip, 1, q, s)
         if w.shape[0] > self.max_weight_filters:
             w = w[:self.max_weight_filters]
         grid_w = vutils.make_grid(w, nrow=ip, normalize=True, scale_each=False)
-        wandb.log({f"Weight_Filters/{layer_name}": wandb.Image(grid_w, caption=f"Weights_Filter of {layer_name}"), "epoch": epoch})
+        return {f"Weight_Filters/{layer_name}": wandb.Image(grid_w, caption=f"Weights_Filter of {layer_name}")}
 
-    def log_featuremap(self, layer_name, activation, epoch):
-        """Handler for logging Conv2d activations."""
+    def compute_featuremap_visuals(self, layer_name, activation):
+        """Computes Conv2d activation visualization."""
         if activation is not None:
             avg_act = activation.mean(dim=1, keepdim=True)
-            grid = vutils.make_grid(avg_act, nrow=self.secondary_dim, normalize=True, scale_each=True)
-            
-            heatmap = grid[0].cpu().numpy()
-            heatmap_colored = cm.viridis(heatmap)[:, :, :3]
-            wandb.log({f"Output/{layer_name}": wandb.Image(heatmap_colored, caption=f"Mean Output of {layer_name}"), "epoch": epoch})
+            imgs = self._create_heatmap_images(avg_act)
+            return {f"Output/{layer_name}": imgs}
+        return {}
 
-    def log_eigen_featuremap(self, layer, layer_name, inputs, epoch):
+    def compute_eigen_featuremap_visuals(self, layer, layer_name, inputs):
         
         #Get Weights and Flatten: (Out, In, H, W) -> (K, C*H*W)
         w = layer.weight.data
@@ -317,7 +379,7 @@ class CNNLogger:
         w_flat = w.reshape(k, -1)
 
         if w_flat.shape[1] > 5000:
-            return
+            return {}
 
         # Compute Gram Matrix and Eigen Decomposition
         gram = torch.matmul(w_flat.t(), w_flat)
@@ -325,7 +387,7 @@ class CNNLogger:
         try:
             vals, vecs = torch.linalg.eigh(gram)
         except RuntimeError:
-            return 
+            return {}
 
         num_vecs = min(10, vecs.shape[1])
         eigen_filters = vecs[:, -num_vecs:].t().reshape(num_vecs, c, h, kw)
@@ -334,21 +396,26 @@ class CNNLogger:
             out = F.conv2d(inputs, eigen_filters, stride=layer.stride, padding=layer.padding)
             
         avg_out = out.mean(dim=1, keepdim=True)
-        grid_avg = vutils.make_grid(avg_out, nrow=self.secondary_dim, normalize=True, scale_each=True)
-        
-        heatmap = grid_avg[0].cpu().numpy()
-        heatmap_colored = cm.viridis(heatmap)[:, :, :3]
-        wandb.log({f"Eigen_Featuremap_Mean/{layer_name}": wandb.Image(heatmap_colored, caption="Average Eigen Filter Response"), "epoch": epoch})
+        imgs = self._create_heatmap_images(avg_out)
+        return {f"Eigen_Featuremap_Mean/{layer_name}": imgs}
 
-    def log_grad_cam(self, net, layer, layer_name, epoch, pred_targets=None):
+    def compute_grad_cam_visuals(self, net, layer, layer_name):
+
         if not self.config:
-            return
+            return {}
 
+        visuals = {}
         inputs = self.viz_inputs
         
         # Enable gradients for Captum
         prev_grad_state = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
+
+        # Optimization: Freeze model parameters to avoid computing gradients for weights
+        original_requires_grad = {}
+        for name, param in net.named_parameters():
+            original_requires_grad[name] = param.requires_grad
+            param.requires_grad = False
         
         try:
             layer_gc = LayerGradCam(net, layer)
@@ -360,23 +427,20 @@ class CNNLogger:
                 attr = layer_gc.attribute(inputs, target=class_idx, relu_attributions=True)
                 attr = LayerAttribution.interpolate(attr, inputs.shape[2:], interpolate_mode='bilinear')
 
-                # Create visualization for this class
-                grid_img = vutils.make_grid(inputs, nrow=self.secondary_dim, normalize=True)
-                grid_attr = vutils.make_grid(attr, nrow=self.secondary_dim, normalize=True, scale_each=True)
-
-                img_np = grid_img.permute(1, 2, 0).cpu().numpy()
-                attr_np = grid_attr.permute(1, 2, 0).cpu().numpy()
-
-                heatmap_colored = cm.viridis(attr_np[:, :, 0])[:, :, :3]
-                blended = img_np * heatmap_colored
-
-                wandb.log({f"GradCAM/class_{class_idx}": wandb.Image(blended, caption=f"GradCAM for Class {class_idx}"), "epoch": epoch})
+                imgs = self._create_blended_images(inputs, attr)
+                visuals[f"GradCAM-{class_idx}"] = imgs
         finally:
+            # Restore requires_grad
+            for name, param in net.named_parameters():
+                param.requires_grad = original_requires_grad.get(name, True)
             torch.set_grad_enabled(prev_grad_state)
+        
+        return visuals
 
-    def log_integrated_gradients(self, net, epoch, pred_targets=None):
+    def compute_ig_visuals(self, net, pred_targets=None):
+
         if not self.config or pred_targets is None:
-            return
+            return {}
 
         inputs = self.viz_inputs
 
@@ -384,48 +448,62 @@ class CNNLogger:
         prev_grad_state = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
 
+        # Optimization: Freeze model parameters to avoid computing gradients for weights
+        original_requires_grad = {}
+        for name, param in net.named_parameters():
+            original_requires_grad[name] = param.requires_grad
+            param.requires_grad = False
+
         try:
             print("Computing Integrated Gradients...")
             ig = IntegratedGradients(net)
-            attr = ig.attribute(inputs, target=pred_targets, n_steps=25)
+            attr = ig.attribute(inputs, target=pred_targets, n_steps=25, internal_batch_size=inputs.shape[0])
             # Sum absolute values across channels to get a single heatmap per image
             attr = torch.sum(torch.abs(attr), dim=1, keepdim=True)
 
-            # Create visualization
-            grid_img = vutils.make_grid(inputs, nrow=self.secondary_dim, normalize=True)
-            grid_attr = vutils.make_grid(attr, nrow=self.secondary_dim, normalize=True, scale_each=True)
-
-            img_np = grid_img.permute(1, 2, 0).cpu().numpy()
-            attr_np = grid_attr.permute(1, 2, 0).cpu().numpy()
-
-            heatmap_colored = cm.viridis(attr_np[:, :, 0])[:, :, :3]
-            blended = img_np * heatmap_colored
-
-            wandb.log({"IntegratedGradients/Predicted": wandb.Image(blended, caption="IG for Predicted Class"), "epoch": epoch})
+            imgs = self._create_blended_images(inputs, attr)
+            return {"IG(Predicted)": imgs}
         finally:
+            # Restore requires_grad
+            for name, param in net.named_parameters():
+                param.requires_grad = original_requires_grad.get(name, True)
             torch.set_grad_enabled(prev_grad_state)
+        
+        return {}
 
     def update_layer_info(self, layer_name, layer, input, output):
+
         self.layer_info[layer_name] = {
             "layer": layer,
             "input": input,
             "output": output
         }
 
-    def log_all(self, epoch, net=None, pred_targets=None):
+    def get_visuals(self, net=None, pred_targets=None):
+        global_logs = {}
+        per_sample_logs = {}
+        
         last_layer_name = list(self.layer_info.keys())[-1] if self.layer_info else None
+        
+        if not self.layer_info:
+            return global_logs, per_sample_logs
+
         for layer_name, info in self.layer_info.items():
             layer = info['layer']
             activation = info['output']
             layer_input = info['input']
-            
-            inputs_subset = layer_input
 
-            self.log_featuremap(layer_name, activation, epoch)
-            if layer_name == last_layer_name:
-                self.log_grad_cam(net, layer, layer_name, epoch, pred_targets=pred_targets)
-                self.log_integrated_gradients(net, epoch, pred_targets=pred_targets)
+            per_sample_logs.update(self.compute_featuremap_visuals(layer_name, activation))
 
             if self.non_critical:
-                self.log_weights(layer, layer_name, epoch)
-                self.log_eigen_featuremap(layer, layer_name, inputs_subset, epoch)
+                global_logs.update(self.log_weights(layer, layer_name))
+                per_sample_logs.update(self.compute_eigen_featuremap_visuals(layer, layer_name, layer_input))
+
+        if net and last_layer_name:
+            last_layer = self.layer_info[last_layer_name]['layer']
+            per_sample_logs.update(self.compute_grad_cam_visuals(net, last_layer, last_layer_name))
+        
+        if net and pred_targets is not None:
+            per_sample_logs.update(self.compute_ig_visuals(net, pred_targets=pred_targets))
+        
+        return global_logs, per_sample_logs

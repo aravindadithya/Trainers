@@ -80,7 +80,7 @@ def get_config(run_id="1", project="CIFAR10", entity="Trainers100", run_name="Re
         "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
         "scheduler_name": type(scheduler).__name__ if scheduler else "None",
         "num_classes": 10,
-        "max_images": 50,
+        "max_images": 15,
         "rotate_inputs": True,
         "net": net,
         "train_loader": trainloader,
