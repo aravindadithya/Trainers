@@ -63,7 +63,7 @@ def get_config(run_id="1", project="CIFAR10", entity="Trainers100", run_name="Re
 
     optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
     lfn = nn.CrossEntropyLoss()
-    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)
+    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=10, steps_per_epoch=1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
     
     config = {

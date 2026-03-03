@@ -4,7 +4,7 @@ import wandb
 import time
 import os
 from torch.amp import autocast
-from utils.special_logger import CNNLogger, BaseLogger
+from utils.base_logger import BaseLogger
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
