@@ -1,6 +1,6 @@
 {
     "name": "Torch Dev Container",
-    "image": "vastai/pytorch:cuda-12.4.1-auto",
+    "image": "vastai/pytorch:cuda-13.0.2-auto",
     "workspaceFolder": "/workspaces", 
     
     "runArgs": [

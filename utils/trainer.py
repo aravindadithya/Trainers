@@ -4,12 +4,12 @@ import wandb
 import time
 import os
 from torch.amp import autocast
-from utils.special_logger import CNNLogger, BaseLogger
+from utils.base_logger import BaseLogger
 scaler = torch.amp.GradScaler('cuda')
 fn_data = {}
 
 
-def train_network(config, num_epochs = 5):
+def train_network(config, num_epochs = 5, checkpoint_interval=10):
 
    
     torch.set_float32_matmul_precision('high')
@@ -32,7 +32,8 @@ def train_network(config, num_epochs = 5):
     logger = BaseLogger(config)
 
     
-    wandb.watch(net, log="all", log_freq=100, idx=0)
+    # wandb.watch can cause significant overhead or hangs with log="all" on some systems
+    # wandb.watch(net, log="all", log_freq=100, idx=0)
     best_test_acc = 0
     best_test_loss = 0
 
@@ -40,8 +41,6 @@ def train_network(config, num_epochs = 5):
     best_val_acc = logger.best_val_acc
     best_val_loss = logger.best_val_loss
     best_state_dict = logger.best_state_dict
-    inputs = logger.inputs
-    targets = logger.targets
 
     for i in range(start_epoch, start_epoch + num_epochs):
 
@@ -84,11 +83,10 @@ def train_network(config, num_epochs = 5):
                                         epoch=i, class_names=[str(c) for c in range(10)],
                                         log_key="Validation Confusion Matrix")
 
-            logger.log_predictions_table(net, val_loader, epoch=i, log_key="Validation Predictions", limit=256)
-            if inputs is not None:
-                specialized_visuals_dispatcher(net, inputs, targets, epoch=i)
+            if logger.inputs is not None:
+                logger.log_visuals(net, epoch=i)
 
-        if i % 10 == 0:
+        if i % checkpoint_interval == 0:
             artifact = wandb.Artifact(f"checkpoint-{config['run_id']}", type='model', metadata={"val_acc": val_acc, "best_val_acc": best_val_acc, "epoch": i})
             with artifact.new_file('last_model.pth', mode='wb') as f:
                 torch.save({
@@ -116,15 +114,12 @@ def train_network(config, num_epochs = 5):
                                 epoch=i, class_names=[str(i) for i in range(10)],
                                 log_key="Test Confusion Matrix")
 
-    logger.log_predictions_table(net, test_loader, epoch=i, log_key="Test Predictions", limit=256)
+    #logger.log_predictions_table(net, test_loader, epoch=i, log_key="Test Predictions", limit=256)
     
 
     logger.finish()
     
     print("FINISHED TRAINING :)")
-
-
-
 
 
 def train_step(net, optimizer, lfn, train_loader):
@@ -176,7 +171,7 @@ def train_step(net, optimizer, lfn, train_loader):
     return train_loss, train_acc
 
 
-def val_step(net, val_loader, lfn):
+def val_step(net, val_loader, lfn=None):
     global scaler
     net.eval()
     val_loss_accum = torch.tensor(0.0, device='cuda')
@@ -184,99 +179,40 @@ def val_step(net, val_loader, lfn):
     total = 0
     all_preds = []
     all_targets = []
+    val_loss = None
 
     for batch_idx, batch in enumerate(val_loader):
         inputs, labels = batch
         targets = labels
         inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True) 
         target = targets.cuda(non_blocking=True)
-        
+
         with torch.no_grad():
             with autocast(device_type='cuda'): 
                 output = net(inputs)
-                loss = lfn(output, target)
-            
-            val_loss_accum += loss.detach() * inputs.size(0)
-            
+                if lfn:
+                    loss = lfn(output, target)
+                    val_loss_accum += loss.detach() * inputs.size(0)
+
             _, predicted = torch.max(output.data, 1)
             total += target.size(0)
             if len(target.size()) > 1:
                 _, labels_idx = torch.max(target, -1)
             else:
                 labels_idx = target
-            
+
             correct_accum += (predicted == labels_idx).sum()
             all_preds.append(predicted)
             all_targets.append(labels_idx)
-        
-    val_loss = val_loss_accum.item() / len(val_loader.dataset)
+
+    if lfn:
+        val_loss = val_loss_accum.item() / len(val_loader.dataset)
+
     val_acc = 100 * correct_accum.item() / total
     all_preds = torch.cat(all_preds).cpu().tolist()
     all_targets = torch.cat(all_targets).cpu().tolist()
-    
+
     return val_loss, val_acc, all_preds, all_targets
-
-
-
-def specialized_visuals_dispatcher(net, inputs, targets, epoch):
-    """
-    Dispatches to specialized visual loggers based on model type.
-    This function uses a generic hook-based mechanism to capture and log layer details.
-    """
-    layer_handlers = {}
-    
-    layer_handlers[torch.nn.Conv2d] = CNNLogger(inputs, targets, secondary_dim=4, max_weight_filters=20)
-
-    if not layer_handlers:
-        return
-
-    net.eval()
-    hooks = []
-
-    def get_activation(name, layer, handler):
-        def hook(model, input, output):
-            inp = input
-            if isinstance(input, tuple):
-                inp = input[0]
-            handler.update_layer_info(name, layer, inp.detach(), output.detach())
-        return hook
-
-    for name, layer in net.named_modules():
-        if type(layer) in layer_handlers:
-            handler = layer_handlers[type(layer)]
-            hooks.append(layer.register_forward_hook(get_activation(name, layer, handler)))
-
-    with torch.no_grad():
-        outputs = net(inputs)
-        pred_targets = torch.argmax(outputs, dim=1)
-
-    for h in hooks:
-        h.remove()
-
-    for handler in layer_handlers.values():
-        handler.log_all(epoch, net=net, pred_targets=pred_targets)
-
-
-def get_acc_ce(net, loader):
-    global scaler
-    net.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs = inputs.to(device='cuda', memory_format=torch.channels_last, non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-            with autocast(device_type='cuda'):
-               outputs = net(inputs)
-            _, predicted = torch.max(outputs.data, 1)  # Get predicted classes
-            total += targets.size(0)
-            # Targets maybe in one-hot format. Hence Max
-            if len(targets.size()) > 1:
-                _, labels = torch.max(targets, -1)
-            else:
-                labels = targets
-            correct += (predicted == labels).sum().item()
-    return 100 * correct / total
 
 
 def get_trained_net(config):

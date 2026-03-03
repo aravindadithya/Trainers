@@ -36,7 +36,7 @@ def get_loaders():
     val_len = len(trainset) - train_len
     trainset, valset = torch.utils.data.random_split(trainset, [train_len, val_len])
 
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=1024, shuffle=True, num_workers=10, pin_memory=True, persistent_workers=True)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=10, pin_memory=True, persistent_workers=True)
     valloader = torch.utils.data.DataLoader(valset, batch_size=1024,
                                                 shuffle=False, num_workers=10, pin_memory=True, persistent_workers=True)
     testset = torchvision.datasets.CIFAR10(root=path, train=False, download=True, transform=transform_test)
@@ -63,7 +63,7 @@ def get_config(run_id="1", project="CIFAR10", entity="Trainers100", run_name="Re
 
     optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
     lfn = nn.CrossEntropyLoss()
-    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=epochs, steps_per_epoch=1)
+    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, epochs=10, steps_per_epoch=1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
     
     config = {
@@ -79,6 +79,9 @@ def get_config(run_id="1", project="CIFAR10", entity="Trainers100", run_name="Re
         "num_parameters": sum(p.numel() for p in net.parameters()),
         "weight_decay": optimizer.param_groups[0].get('weight_decay', 0),
         "scheduler_name": type(scheduler).__name__ if scheduler else "None",
+        "num_classes": 10,
+        "max_images": 15,
+        "rotate_inputs": True,
         "net": net,
         "train_loader": trainloader,
         "val_loader": valloader,
